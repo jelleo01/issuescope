@@ -1,7 +1,7 @@
-“””
+"""
 IssueScope
 환경변수: ANTHROPIC_API_KEY (필수), GNEWS_KEY (선택), NAVER_CLIENT_ID / NAVER_CLIENT_SECRET (선택)
-“””
+"""
 import os, re, json, xml.etree.ElementTree as ET
 import requests
 from bs4 import BeautifulSoup
