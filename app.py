@@ -139,29 +139,40 @@ def fetch_google_rss(query, max_items=40):
     resp.raise_for_status()
     root = ET.fromstring(resp.content)
     items = []
-    for item in root.findall(".//item")[:max_items]:
+    for i, item in enumerate(root.findall(".//item")[:max_items]):
         raw = item.findtext("title") or ""
         title = re.sub(r" - [^-]+$", "", clean(raw)).strip()
         if not title: continue
 
-        # description HTML 안에 실제 기사 URL이 있음
         desc_raw = item.findtext("description") or ""
+
+        # 첫 3개 기사 description 구조 디버깅
+        if i < 3:
+            print(f"[rss-debug] desc raw: {repr(desc_raw[:300])}")
+
+        # description에서 실제 뉴스 기사 URL만 추출 (구글·lh3 제외)
         real_urls = re.findall(
-            r'href="(https?://(?!news\.google\.com)[^"]+)"', desc_raw)
+            r'href="(https?://(?!(?:news\.google|lh3\.google|google\.com|gstatic)[^\s"])[^"]+)"',
+            desc_raw)
+
+        # source 태그의 url 속성 활용
+        src_el = item.find("source")
+        source_url = src_el.get("url","") if src_el is not None else ""
+
         link = real_urls[0] if real_urls else ""
-        # fallback: <link> 태그 (구글 리다이렉트 URL)
-        if not link:
-            for child in item:
-                if child.tag == "link":
-                    link = (child.tail or child.text or "").strip(); break
+
+        # fallback: source url 도메인 + 기사 검색 (없으면 빈값)
+        if not link and source_url:
+            print(f"[rss] no direct url, source domain: {source_url}")
 
         pub = item.findtext("pubDate") or ""
         desc = clean(desc_raw)[:200]
-        src_el = item.find("source")
         source = (src_el.text.strip() if src_el is not None and src_el.text
                   else (re.search(r" - ([^-]+)$", raw) or [None,"알 수 없음"])[1])
-        print(f"[rss] '{title[:40]}' → {link[:60]}")
-        items.append({"title":title,"source":source,"url":link,"publishedAt":pub,"description":desc})
+        print(f"[rss] '{title[:40]}' → {link[:70] or 'NO URL'}")
+        items.append({"title":title,"source":source,"url":link,
+                      "publishedAt":pub,"description":desc,
+                      "source_url": source_url})
     return items
 
 def fetch_naver(query, n=20):
