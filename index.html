@@ -336,363 +336,223 @@ a:hover{text-decoration:underline}
 </div>
 
 <script>
-// ═══════════════════════════════════════════════
-//  STATE
-// ═══════════════════════════════════════════════
-const S = {
-  query: '', articles: [], issues: [], summary: '',
-  sort: 'relevance', selectedId: null, loading: false
+// ─── STATE ───
+const S = { query:'', articles:[], issues:[], summary:'', sort:'relevance', selectedId:null };
+
+// ─── TAG / SCORE HELPERS ───
+const TAG_KW = {
+  market:['주가','시장','코스피','코스닥','증시','투자','거래','수급','매수','매도','상장','ETF','지수'],
+  legal:['법원','판결','소송','규정','위반','처벌','기소','판례','헌법','형사','민사'],
+  policy:['정부','규제','금감원','금융위','당국','정책','법안','행정','개정','시행'],
+  company:['기업','삼성','현대','SK','LG','카카오','네이버','대기업','스타트업','이사회','상장사'],
+  finance:['금리','채권','주식','환율','달러','원화','CB','BW','사채','증권','대출','부채'],
+  controversy:['논란','갈등','문제','비판','반발','우려','충돌','파장','쟁점','사태']
 };
-
-// ═══════════════════════════════════════════════
-//  TAG / RELEVANCE HELPERS
-// ═══════════════════════════════════════════════
-const TAG_KEYWORDS = {
-  market:      ['주가','시장','코스피','코스닥','증시','투자','거래','수급','오버행','변동','매수','매도','상장','IPO','etf','ETF','펀드','지수'],
-  legal:       ['법원','판결','소송','법률','규정','위반','처벌','기소','형사','민사','고소','항소','대법원','판례','헌법','위헌'],
-  policy:      ['정부','규제','금감원','금융위','당국','정책','법안','입법','개정','시행','행정','기획재정부','국토부','복지부','복지'],
-  company:     ['기업','삼성','현대','SK','LG','롯데','카카오','네이버','포스코','대기업','스타트업','벤처','상장사','이사회','주주'],
-  finance:     ['금리','채권','주식','환율','달러','원화','인플레','금융','CB','BW','전환','사채','증권','투자','자금','대출','부채'],
-  controversy: ['논란','갈등','문제','비판','반발','우려','충돌','파장','쟁점','논쟁','대립','항의','반대','이슈','사태','사건']
-};
-
-function inferTags(title, snip) {
-  const txt = (title + ' ' + snip).toLowerCase();
-  return Object.entries(TAG_KEYWORDS)
-    .filter(([, kws]) => kws.some(k => txt.includes(k.toLowerCase())))
-    .map(([tag]) => tag)
-    .slice(0, 3);
-}
-
 const TAG_LABELS = {market:'시장',legal:'법률',policy:'정책',company:'기업',finance:'금융',controversy:'논란'};
 const TAG_CLASS  = {market:'t-market',legal:'t-legal',policy:'t-policy',company:'t-company',finance:'t-finance',controversy:'t-controversy'};
 
+function inferTags(title, snip) {
+  const txt = (title+' '+snip).toLowerCase();
+  return Object.entries(TAG_KW).filter(([,kws])=>kws.some(k=>txt.includes(k.toLowerCase()))).map(([t])=>t).slice(0,2);
+}
 function scoreRelevance(title, snip, query) {
   const terms = query.trim().split(/\s+/);
-  const text = (title + ' ' + snip).toLowerCase();
-  let score = 0.55; // base
+  const txt = (title+' '+snip).toLowerCase();
+  let s = 0.55;
   terms.forEach(t => {
-    const tl = t.toLowerCase();
-    if (title.toLowerCase().includes(tl)) score += 0.25;
-    if (snip.toLowerCase().includes(tl))  score += 0.10;
+    if (title.toLowerCase().includes(t.toLowerCase())) s += 0.25;
+    if (snip.toLowerCase().includes(t.toLowerCase()))  s += 0.10;
   });
-  return Math.min(score, 0.99);
+  return Math.min(s, 0.99);
 }
-
 function relTime(s) {
   if (!s) return '';
   const d = new Date(s), n = new Date();
-  const diff = n - d;
-  const h = Math.floor(diff / 3600000);
-  const dy = Math.floor(diff / 86400000);
+  const h = Math.floor((n-d)/3600000), dy = Math.floor((n-d)/86400000);
   if (isNaN(h)) return '';
   if (h < 1)  return '방금 전';
   if (h < 24) return `${h}시간 전`;
   if (dy < 7) return `${dy}일 전`;
-  return d.toLocaleDateString('ko-KR', {month:'long', day:'numeric'});
+  return d.toLocaleDateString('ko-KR',{month:'long',day:'numeric'});
 }
+function renderTag(t) { return `<span class="tag ${TAG_CLASS[t]||'t-market'}">${TAG_LABELS[t]||t}</span>`; }
+function setStatus(h) { document.getElementById('fetch-status').innerHTML = h||''; }
 
-// ═══════════════════════════════════════════════
-// ═══════════════════════════════════════════════
-//  뉴스 수집 — Netlify 서버사이드 함수 호출
-//  (서버에서 Google News RSS 직접 수집 → CORS 문제 없음)
-// ═══════════════════════════════════════════════
-function makeArticle(i, title, source, url, pubDate, snippet, query) {
-  var t = (title || '').replace(/ - [^-]+$/, '').replace(/<[^>]*>/g, '').trim();
-  var snip = (snippet || '').replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim().substring(0, 320);
-  var src = (source || '').trim() || (title.match(/ - ([^-]+)$/) || [])[1] || '알 수 없음';
-  var pub;
-  try { pub = pubDate ? new Date(pubDate).toISOString() : new Date().toISOString(); }
-  catch(e) { pub = new Date().toISOString(); }
+// ─── NEWS FETCH ───
+function makeArticle(i, a, query) {
+  const t = (a.title||'').trim();
+  const snip = (a.description||a.content||'').replace(/<[^>]*>/g,'').trim().substring(0,320);
+  const src = (a.source||(typeof a.source==='object'?a.source?.name:'')||'알 수 없음').toString().trim();
+  let pub;
+  try { pub = a.publishedAt ? new Date(a.publishedAt).toISOString() : new Date().toISOString(); } catch { pub = new Date().toISOString(); }
   return {
-    id: 'art_' + i, title: t, source: src, url: url || '#', publishedAt: pub,
-    snippet: snip,
-    score: Math.max(scoreRelevance(t, snip, query) - i * 0.005, 0.38),
+    id:`art_${i}`, title:t, source:src, url:a.url||a.link||'#',
+    publishedAt:pub, snippet:snip,
+    score: Math.max(scoreRelevance(t, snip, query) - i*0.005, 0.38),
     tags: inferTags(t, snip),
-    bullets: null, rel: null, entities: null, impl: null
+    bullets:null, rel:null, impl:null
   };
 }
 
-function fetchRSSNews(query, maxItems) {
-  maxItems = maxItems || 50;
-  return fetch('/api/news?q=' + encodeURIComponent(query))
-    .then(function(res) {
-      if (!res.ok) throw new Error('서버 오류 HTTP ' + res.status);
-      return res.json();
-    })
-    .then(function(d) {
-      if (d.error && !(d.items && d.items.length)) throw new Error(d.error);
-      var items = (d.items || []).slice(0, maxItems);
-      if (!items.length) throw new Error('수집된 기사가 없습니다');
-      return items.map(function(item, i) {
-        return makeArticle(i, item.title, item.source, item.link, item.pubDate, item.description, query);
-      });
-    });
+async function fetchRSSNews(query, maxItems=40) {
+  const res = await fetch('/api/news?q=' + encodeURIComponent(query));
+  if (!res.ok) throw new Error(`서버 오류 HTTP ${res.status}`);
+  const d = await res.json();
+  if (d.error && !(d.items?.length)) throw new Error(d.error);
+  const items = (d.items || []).slice(0, maxItems);
+  if (!items.length) throw new Error('검색 결과가 없습니다');
+  return items.map((a, i) => makeArticle(i, a, query));
 }
 
-// ═══════════════════════════════════════════════
-//  LOCAL ISSUE EXTRACTION (no API key needed)
-// ═══════════════════════════════════════════════
-const KO_STOPWORDS = new Set(['이','가','을','를','은','는','에','의','로','와','과','이다','하다','있다','없다','등','및','대한','관련','대해','통해','위한','위해','것이','것은','것을','하지만','그러나','그리고','또한','또','이번','지난','올해','오는','오늘','내년','작년','이후','이전','때문','따라','통해','함께','한다','했다','했으며','밝혔다','나타났다','됐다','됩니다','한편','따르면','이라고','이며','로서','으로서','부터','까지','에서','에게','에게서','위해서','그것','이것','저것','아니라','뿐만','뿐이다','정도','수준','상황','경우','문제','있어','있는','하는','되는','하여','하면','하고','하며','해서','라며','라고','이라며']);
+// ─── LOCAL ISSUE EXTRACTION ───
+const KO_STOP = new Set(['이','가','을','를','은','는','에','의','로','와','과','등','및','대한','관련','통해','위한','것은','것을','하다','있다','없다','이번','지난','됩니다','밝혔다','따르면','이라고','이며','하여','되어','으로','에서','부터','까지']);
+function tokenize(t) { return (t.match(/[가-힣a-zA-Z]{2,}/g)||[]).filter(w=>!KO_STOP.has(w)&&w.length>=2); }
 
-function tokenize(text) {
-  // 2글자 이상 한국어/영어 단어 추출
-  const words = text.match(/[가-힣a-zA-Z]{2,}/g) || [];
-  return words.filter(w => !KO_STOPWORDS.has(w) && w.length >= 2);
-}
+const TAG_ISSUE = {
+  market:'시장 반응 및 주가 영향', legal:'법적 분쟁 및 규제 위반',
+  policy:'정책 및 규제 동향', company:'기업 동향 및 전략',
+  finance:'금융 시장 및 자금 조달', controversy:'논란 및 사회적 갈등'
+};
+const TAG_SEV = {market:'medium',legal:'high',policy:'high',company:'medium',finance:'medium',controversy:'high'};
 
 function extractLocalIssues(articles, query) {
-  // 1. 빈도 집계 (제목에 2배 가중)
+  if (!articles?.length) return [];
+
+  // 1) 태그 클러스터
+  const tagGroups = {};
+  articles.forEach(a => (a.tags||[]).forEach(tag => { (tagGroups[tag]||(tagGroups[tag]=[])).push(a); }));
+
+  const tagIssues = Object.entries(tagGroups)
+    .sort((a,b) => b[1].length - a[1].length).slice(0,3)
+    .map(([tag, arts], i) => ({
+      id:`tag${i}`, title: TAG_ISSUE[tag]||tag,
+      desc: `${query} 관련 ${TAG_ISSUE[tag]||tag} 보도가 ${arts.length}건 있습니다.${arts[0]?.title ? ` "${arts[0].title.substring(0,40)}…" 등이 주요 기사입니다.` : ''}`,
+      refs: arts.slice(0,3).map(a=>a.id), sev: TAG_SEV[tag]||'medium'
+    }));
+
+  // 2) 키워드 클러스터 (추가)
   const freq = {};
   articles.forEach(a => {
-    const titleWords = tokenize(a.title);
-    const snippetWords = tokenize(a.snippet || '');
-    titleWords.forEach(w => { freq[w] = (freq[w] || 0) + 2; });
-    snippetWords.forEach(w => { freq[w] = (freq[w] || 0) + 1; });
+    tokenize(a.title).forEach(w => { freq[w]=(freq[w]||0)+2; });
+    tokenize(a.snippet||'').forEach(w => { freq[w]=(freq[w]||0)+1; });
   });
-
-  // 쿼리 단어 제거 (너무 흔해서 의미없음)
   tokenize(query).forEach(w => delete freq[w]);
+  const topWords = Object.entries(freq).filter(([,c])=>c>=2).sort((a,b)=>b[1]-a[1]).slice(0,15).map(([w])=>w);
 
-  // 2. 상위 키워드
-  const topWords = Object.entries(freq)
-    .filter(([, c]) => c >= 2)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 30)
-    .map(([w]) => w);
-
-  if (!topWords.length) {
-    return [{
-      id: 'i0', title: `${query} 관련 최신 동향`,
-      desc: `${query}에 관한 최신 뉴스 ${articles.length}건이 수집되었습니다. 다양한 관점의 기사가 포함되어 있습니다.`,
-      refs: articles.slice(0,3).map(a=>a.id), sev: 'medium'
-    }];
-  }
-
-  // 3. 클러스터: 각 키워드 기준으로 관련 기사 묶기
-  const clusters = [];
-  const used = new Set();
-
+  const kwIssues = [];
   for (const kw of topWords) {
-    if (clusters.length >= 5) break;
-    const matches = articles.filter(a =>
-      (a.title + ' ' + (a.snippet||'')).includes(kw)
-    );
-    if (matches.length < 2) continue;
-
-    const matchIds = matches.map(a => a.id);
-    const isNovel = !clusters.some(c =>
-      matchIds.filter(id => c.refs.includes(id)).length > matchIds.length * 0.6
-    );
-    if (!isNovel) continue;
-
-    // 이 클러스터의 부연 키워드 (kw 제외 상위어)
-    const subFreq = {};
-    matches.forEach(a => {
-      tokenize(a.title + ' ' + (a.snippet||'')).forEach(w => {
-        if (w !== kw) subFreq[w] = (subFreq[w]||0)+1;
-      });
-    });
-    const sub = Object.entries(subFreq).sort((a,b)=>b[1]-a[1]).slice(0,3).map(([w])=>w);
-
-    clusters.push({
-      keyword: kw, sub,
-      refs: matches.slice(0,4).map(a=>a.id),
-      count: matches.length
-    });
-    matchIds.forEach(id => used.add(id));
+    if (kwIssues.length >= 2) break;
+    const ms = articles.filter(a => (a.title+' '+(a.snippet||'')).includes(kw));
+    if (ms.length < 2) continue;
+    const dup = tagIssues.some(ti => ms.filter(a=>ti.refs.includes(a.id)).length > ms.length*0.7);
+    if (dup) continue;
+    kwIssues.push({ id:`kw${kwIssues.length}`, title:`'${kw}' 집중 보도`,
+      desc:`${query} 뉴스에서 '${kw}' 관련 보도가 ${ms.length}건 집중되고 있습니다.${ms[0]?.title ? ` "${ms[0].title.substring(0,40)}…" 등이 주요 기사입니다.` : ''}`,
+      refs: ms.slice(0,3).map(a=>a.id), sev:'medium' });
   }
 
-  // 4. 이슈 텍스트 생성
-  const sevOrder = ['high','high','medium','medium','low'];
+  const all = [...tagIssues, ...kwIssues].slice(0,5);
 
-  return clusters.map((c, i) => {
-    const relArts = articles.filter(a => c.refs.includes(a.id));
-    const sampleTitle = relArts[0]?.title || '';
-    const subStr = c.sub.slice(0,2).join(', ');
-
-    return {
-      id: `i${i}`,
-      title: `'${c.keyword}' 관련 ${c.count}건 보도 집중`,
-      desc: `${query} 관련 뉴스 중 '${c.keyword}'${subStr ? ` (연관: ${subStr})` : ''}에 대한 보도가 집중되고 있습니다. ${sampleTitle ? `최근에는 "${cleanTitle(sampleTitle)}"와 같은 내용이 주목받고 있습니다.` : ''} 총 ${c.count}개 기사가 이 주제를 다루고 있습니다.`,
-      refs: c.refs,
-      sev: sevOrder[i] || 'low'
-    };
-  });
+  // 3) 폴백: 기사 자체로 이슈 생성
+  if (!all.length) {
+    return articles.slice(0,3).map((a,i) => ({
+      id:`fb${i}`, title: a.title.substring(0,30)+'…',
+      desc: a.snippet ? a.snippet.substring(0,120)+'…' : '원문을 확인하세요.',
+      refs:[a.id], sev: i===0?'high':'medium'
+    }));
+  }
+  return all;
 }
 
 function buildLocalSummary(articles, query) {
-  const sources = [...new Set(articles.slice(0,10).map(a => a.source))];
-  const hours = articles.filter(a => {
-    try { return (new Date() - new Date(a.publishedAt)) < 86400000; } catch { return false; }
-  }).length;
-
-  return `'${query}'에 관한 최신 뉴스 ${articles.length}건이 수집되었습니다. ${hours > 0 ? `이 중 ${hours}건이 24시간 이내에 보도되었습니다. ` : ''}${sources.slice(0,4).join(', ')} 등 주요 매체에서 다양한 각도로 보도 중입니다. 아래 핵심 이슈는 기사 내 반복 키워드 분석으로 자동 추출되었습니다.`;
+  if (!articles?.length) return `'${query}' 관련 기사를 수집했습니다.`;
+  const srcs = [...new Set(articles.slice(0,8).map(a=>a.source).filter(Boolean))].slice(0,4);
+  const r24 = articles.filter(a => { try { return (new Date()-new Date(a.publishedAt))<86400000; } catch { return false; } }).length;
+  const tagCount = {};
+  articles.forEach(a => (a.tags||[]).forEach(t => { tagCount[t]=(tagCount[t]||0)+1; }));
+  const topTag = Object.entries(tagCount).sort((a,b)=>b[1]-a[1])[0];
+  const topTagLabel = {market:'시장/주가',legal:'법률/규제',policy:'정책',company:'기업동향',finance:'금융',controversy:'논란'}[topTag?.[0]]||'';
+  return `'${query}'에 관한 최신 뉴스 ${articles.length}건이 수집됐습니다.`
+    + (r24>0 ? ` 이 중 ${r24}건이 24시간 이내 보도입니다.` : '')
+    + (topTagLabel ? ` 주요 보도 방향은 ${topTagLabel} 관련입니다.` : '')
+    + (srcs.length ? ` ${srcs.join(', ')} 등에서 다루고 있습니다.` : '');
 }
 
-// ═══════════════════════════════════════════════
-//  CLAUDE API (선택적, CORS 우회 시도)
-// ═══════════════════════════════════════════════
+// ─── CLAUDE API ───
 async function callClaude(prompt, apiKey) {
-  const body = JSON.stringify({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 1500,
-    messages: [{ role: 'user', content: prompt }]
-  });
-  const headers = {
-    'Content-Type': 'application/json',
-    'x-api-key': apiKey,
-    'anthropic-version': '2023-06-01'
-  };
-
-  // signal 없이 직접 호출 (iOS 호환)
+  const body = JSON.stringify({ model:'claude-sonnet-4-20250514', max_tokens:1500, messages:[{role:'user',content:prompt}] });
+  const headers = { 'Content-Type':'application/json', 'x-api-key':apiKey, 'anthropic-version':'2023-06-01' };
   try {
-    const res = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers, body });
+    const res = await fetch('https://api.anthropic.com/v1/messages', {method:'POST', headers, body});
     if (res.ok) return await res.json();
-  } catch { /* CORS 실패 */ }
-
+  } catch {}
   try {
-    const res = await fetch(
-      'https://corsproxy.io/?' + encodeURIComponent('https://api.anthropic.com/v1/messages'),
-      { method: 'POST', headers, body }
-    );
+    const res = await fetch('https://corsproxy.io/?'+encodeURIComponent('https://api.anthropic.com/v1/messages'), {method:'POST', headers, body});
     if (res.ok) return await res.json();
-  } catch { /* 실패 */ }
-
+  } catch {}
   throw new Error('Claude API 호출 실패');
 }
 
 async function fetchClaudeIssues(query, articles, apiKey) {
-  const txt = articles.slice(0, 25).map((a, i) =>
-    `[${a.id}] "${a.title}" (${a.source}, ${relTime(a.publishedAt)})\n${a.snippet}`
-  ).join('\n\n');
-
-  const ids = articles.slice(0, 25).map(a => a.id).join(', ');
-
-  const prompt = `당신은 한국 뉴스 분석 전문가입니다. 다음은 "${query}" 키워드로 검색된 최신 기사 ${articles.slice(0,25).length}건입니다.
-
-${txt}
-
-아래 JSON 형식으로만 답하세요 (마크다운, 설명 없이 순수 JSON):
-{
-  "overallSummary": "현황을 한국어 2-3문장으로 요약. 기사 수, 주요 매체, 핵심 흐름 포함",
-  "mainIssues": [
-    {
-      "id": "i1",
-      "title": "짧은 한국어 이슈 제목 (20자 이내)",
-      "desc": "이슈 설명 2-3문장. 구체적 사실 기반으로 작성",
-      "refs": ["기사 id 1-3개"],
-      "sev": "high|medium|low"
-    }
-  ]
-}
-
-기사 ID 목록: ${ids}
-한국어로 답하세요. 3-6개 이슈. 구체적이고 사실 기반으로 작성하세요.`;
-
+  const txt = articles.slice(0,25).map(a=>`[${a.id}] "${a.title}" (${a.source})\n${a.snippet}`).join('\n\n');
+  const ids = articles.slice(0,25).map(a=>a.id).join(', ');
+  const prompt = `한국 뉴스 분석 전문가. "${query}" 키워드 최신 기사 ${Math.min(articles.length,25)}건:\n\n${txt}\n\nJSON만 반환 (마크다운 없이):\n{"overallSummary":"현황 2-3문장 요약. 구체적 수치·사실 포함","mainIssues":[{"id":"i1","title":"이슈 제목 20자 이내","desc":"구체적 사실 기반 2-3문장. 무슨 일이 왜 중요한지","refs":["기사id"],"sev":"high|medium|low"}]}\n기사ID: ${ids}\n한국어, 3-5개 이슈.`;
   const data = await callClaude(prompt, apiKey);
-  const text = (data.content||[]).find(c=>c.type==='text')?.text || '';
-  const cleaned = text.replace(/```json|```/g,'').trim();
-  const parsed = JSON.parse(cleaned);
+  const text = (data.content||[]).find(c=>c.type==='text')?.text||'';
+  const parsed = JSON.parse(text.replace(/```json|```/g,'').trim());
   return {
-    summary: parsed.overallSummary || '',
-    issues: (parsed.mainIssues || []).map(x => ({
-      id: x.id, title: x.title, desc: x.desc || x.description,
-      refs: x.refs || x.supportingArticleIds || [],
-      sev: x.sev || x.severity || 'medium'
-    }))
+    summary: parsed.overallSummary||'',
+    issues: (parsed.mainIssues||[]).map(x=>({id:x.id,title:x.title,desc:x.desc||x.description,refs:x.refs||[],sev:x.sev||'medium'}))
   };
 }
 
-async function fetchClaudeArticleDetail(article, query, apiKey) {
-  const prompt = `다음 기사를 분석하세요. 주제 키워드: "${query}"
-
-제목: ${article.title}
-출처: ${article.source}
-내용 요약: ${article.snippet}
-
-JSON 형식으로만 답하세요:
-{
-  "bullets": ["핵심 포인트 4-5개. 각 포인트는 한 문장"],
-  "rel": "이 기사가 '${query}'와 왜 관련 있는지 한 문장",
-  "entities": ["핵심 등장 주체/기관/용어 3-6개"],
-  "impl": ["시사점/전망 2-4개. 각각 한 문장"]
-}
-
-한국어로만 답하세요.`;
-
+async function fetchClaudeDetail(article, query, apiKey) {
+  const prompt = `기사 분석. 검색 주제: "${query}"\n제목: ${article.title}\n내용: ${article.snippet}\n\nJSON만 (마크다운 없이):\n{\n"bullets":["핵심 내용 4-5개. 구체적 사실·수치·주체 포함. 무슨 일이 있었는지 서술."],\n"rel":"'${query}'와 구체적으로 어떻게 연관되는지 1-2문장. 키워드 언급 표현 절대 금지. 실제 인과관계·영향 메커니즘 서술.",\n"impl":["시사점 또는 향후 전망 2-3개. 구체적으로."]\n}\n한국어.`;
   const data = await callClaude(prompt, apiKey);
-  const text = (data.content||[]).find(c=>c.type==='text')?.text || '';
-  const cleaned = text.replace(/```json|```/g,'').trim();
-  return JSON.parse(cleaned);
+  const text = (data.content||[]).find(c=>c.type==='text')?.text||'';
+  return JSON.parse(text.replace(/```json|```/g,'').trim());
 }
 
-// ═══════════════════════════════════════════════
-//  RENDER FUNCTIONS
-// ═══════════════════════════════════════════════
-function renderTag(t) {
-  return `<span class="tag ${TAG_CLASS[t]||'t-market'}">${TAG_LABELS[t]||t}</span>`;
-}
-
+// ─── RENDER: CARDS ───
 function renderArticleCards() {
-  const sorted = [...S.articles].sort((a, b) =>
-    S.sort === 'date'
-      ? new Date(b.publishedAt) - new Date(a.publishedAt)
-      : b.score - a.score
+  const sorted = [...S.articles].sort((a,b) =>
+    S.sort==='date' ? new Date(b.publishedAt)-new Date(a.publishedAt) : b.score-a.score
   );
-
-  document.getElementById('articles-container').innerHTML = sorted.map((a, i) => {
-    const sp = Math.min(Math.round(a.score * 100), 99);
-    const sel = S.selectedId === a.id;
+  document.getElementById('articles-container').innerHTML = sorted.map((a,i) => {
+    const sp = Math.min(Math.round(a.score*100),99), sel = S.selectedId===a.id;
     return `<div class="a-card${sel?' sel':''}" data-id="${a.id}" style="animation-delay:${Math.min(i*.04,1.2)}s">
-  <div class="ch">
-    <div class="crank${sel?' sel':''}">${i+1}</div>
-    <div class="ctitle">${a.title}</div>
-  </div>
-  <div class="csnip">${a.snippet || '내용 없음'}</div>
+  <div class="ch"><div class="crank${sel?' sel':''}">${i+1}</div><div class="ctitle">${a.title}</div></div>
+  <div class="csnip">${a.snippet||'내용 없음'}</div>
   <div class="cfoot">
-    <span class="csrc">${a.source}</span>
-    <span class="cdot">•</span>
-    <span class="ctime">${relTime(a.publishedAt)}</span>
-    <span class="csp"></span>
-    ${a.tags.slice(0,2).map(renderTag).join('')}
-    <div class="score-pill">
-      <div class="sbw"><div class="sbf" style="width:${sp}%"></div></div>
-      <span class="sct">${sp}%</span>
-    </div>
-    ${a.url !== '#' ? `<a class="ext-link" href="${a.url}" target="_blank" rel="noopener" onclick="event.stopPropagation()">↗</a>` : ''}
+    <span class="csrc">${a.source}</span><span class="cdot">•</span><span class="ctime">${relTime(a.publishedAt)}</span>
+    <span class="csp"></span>${a.tags.slice(0,2).map(renderTag).join('')}
+    <div class="score-pill"><div class="sbw"><div class="sbf" style="width:${sp}%"></div></div><span class="sct">${sp}%</span></div>
+    ${a.url&&a.url!=='#'?`<a class="ext-link" href="${a.url}" target="_blank" rel="noopener" onclick="event.stopPropagation()">↗</a>`:''}
   </div>
 </div>`;
   }).join('');
-
   document.querySelectorAll('.a-card').forEach(el => {
     el.addEventListener('click', () => {
       const id = el.dataset.id;
-      S.selectedId = S.selectedId === id ? null : id;
+      S.selectedId = S.selectedId===id ? null : id;
       renderArticleCards();
-      if (S.selectedId) {
-        showArticleDetail(S.articles.find(a => a.id === id));
-        document.getElementById('panel-lbl').textContent = '기사 분석';
-      } else {
-        renderIssuePanel();
-        document.getElementById('panel-lbl').textContent = '핵심 이슈 분석';
-      }
+      if (S.selectedId) { showArticleDetail(S.articles.find(a=>a.id===id)); document.getElementById('panel-lbl').textContent='기사 분석'; }
+      else { renderIssuePanel(); document.getElementById('panel-lbl').textContent='핵심 이슈 분석'; }
     });
   });
 }
 
-function renderSkeletonCards(n = 6) {
-  document.getElementById('articles-container').innerHTML = Array.from({length:n}, (_, i) => `
+function renderSkeletonCards(n=6) {
+  document.getElementById('articles-container').innerHTML = Array.from({length:n},(_,i)=>`
 <div class="skel-card" style="opacity:${1-i*.12}">
-  <div style="display:flex;gap:9px;margin-bottom:8px">
-    <div class="skel" style="width:21px;height:21px;border-radius:5px;flex-shrink:0"></div>
-    <div style="flex:1"><div class="skel" style="height:14px;margin-bottom:6px"></div><div class="skel" style="height:14px;width:70%"></div></div>
-  </div>
+  <div style="display:flex;gap:9px;margin-bottom:8px"><div class="skel" style="width:21px;height:21px;border-radius:5px;flex-shrink:0"></div>
+  <div style="flex:1"><div class="skel" style="height:14px;margin-bottom:6px"></div><div class="skel" style="height:14px;width:70%"></div></div></div>
   <div style="margin-left:30px"><div class="skel" style="height:11px;margin-bottom:5px"></div><div class="skel" style="height:11px;width:80%;margin-bottom:10px"></div>
   <div style="display:flex;gap:7px"><div class="skel" style="height:17px;width:55px;border-radius:100px"></div><div class="skel" style="height:17px;width:55px;border-radius:100px"></div></div></div>
 </div>`).join('');
 }
 
+// ─── RENDER: ISSUE PANEL ───
 function renderIssueSkeleton() {
   document.getElementById('right-panel').innerHTML = `
 <div style="background:var(--ac);opacity:.35;border-radius:14px;padding:14px 16px;margin-bottom:11px">
@@ -700,23 +560,20 @@ function renderIssueSkeleton() {
   <div class="skel" style="height:12px;margin-bottom:5px;background:rgba(255,255,255,.3)"></div>
   <div class="skel" style="height:12px;width:75%;background:rgba(255,255,255,.3)"></div>
 </div>
-${[1,2,3,4].map(i=>`<div class="iss-card" style="opacity:${1-i*.18}">
+${[1,2,3].map(i=>`<div class="iss-card" style="opacity:${1-i*.2}">
   <div class="ih"><div class="inum skel" style="background:var(--bgs)"></div>
   <div style="flex:1"><div class="skel" style="height:13px;width:65%;margin-bottom:7px"></div>
   <div class="skel" style="height:11px;margin-bottom:4px"></div><div class="skel" style="height:11px;width:82%"></div></div></div></div>`).join('')}`;
 }
 
 function renderIssuePanel() {
-  const { issues, summary, articles } = S;
+  const {issues, summary, articles} = S;
   document.getElementById('right-panel').innerHTML = `
-<div class="panel-summ">
-  <div class="ps-lbl">종합 분석</div>
-  <div class="ps-text">${summary}</div>
-</div>
+<div class="panel-summ"><div class="ps-lbl">종합 분석</div><div class="ps-text">${summary||'분석 중...'}</div></div>
 <div class="iss-lbl"><span>핵심 이슈 ${issues.length}개</span><div class="iss-line"></div></div>
-${issues.map((iss, idx) => {
-  const refs = (iss.refs || []).map(rid => {
-    const a = articles.find(x => x.id === rid);
+${issues.map((iss,idx) => {
+  const refs = (iss.refs||[]).map(rid => {
+    const a = articles.find(x=>x.id===rid);
     return a ? `<button class="ref-btn" data-ref="${a.id}">↗ ${a.source}: ${a.title.substring(0,34)}…</button>` : '';
   }).join('');
   return `<div class="iss-card">
@@ -725,100 +582,54 @@ ${issues.map((iss, idx) => {
     <div style="flex:1">
       <div style="display:flex;align-items:flex-start;gap:6px;margin-bottom:5px">
         <div class="ititle">${iss.title}</div>
-        <span class="sbadge s${iss.sev}">${iss.sev==='high'?'주요':iss.sev==='medium'?'중요':'참고'}</span>
+        <span class="sbadge s${(iss.sev||'m').charAt(0)}">${iss.sev==='high'?'주요':iss.sev==='medium'?'중요':'참고'}</span>
       </div>
       <div class="idesc">${iss.desc}</div>
     </div>
   </div>
-  ${refs ? `<span class="ref-lbl">관련 기사</span>${refs}` : ''}
+  ${refs?`<span class="ref-lbl">관련 기사</span>${refs}`:''}
 </div>`;
 }).join('')}
 <div class="tip">💡 기사 카드를 클릭하면 해당 기사의 상세 분석을 볼 수 있습니다.</div>`;
-
   document.querySelectorAll('.ref-btn').forEach(btn => {
     btn.addEventListener('click', () => {
-      const id = btn.dataset.ref;
-      S.selectedId = id;
-      renderArticleCards();
-      const a = S.articles.find(x => x.id === id);
-      if (a) { showArticleDetail(a); document.getElementById('panel-lbl').textContent = '기사 분석'; }
+      const a = S.articles.find(x=>x.id===btn.dataset.ref);
+      if (a) { S.selectedId=a.id; renderArticleCards(); showArticleDetail(a); document.getElementById('panel-lbl').textContent='기사 분석'; }
     });
   });
 }
 
+// ─── RENDER: ARTICLE DETAIL ───
 async function showArticleDetail(a) {
   const apiKey = document.getElementById('api-key-input').value.trim();
-
-  // 이미 분석된 경우
   if (a.bullets) { renderDetailPanel(a); return; }
-
-  // API 키가 있으면 Claude로 분석
   if (apiKey) {
-    renderDetailPanelLoading(a);
+    document.getElementById('right-panel').innerHTML = `<button class="back-btn" id="back-btn">← 전체 이슈로 돌아가기</button><div class="status-box status-loading"><div class="spin"></div>Claude가 분석 중...</div>`;
+    document.getElementById('back-btn').addEventListener('click', doBack);
     try {
-      const detail = await fetchClaudeArticleDetail(a, S.query, apiKey);
-      a.bullets = detail.bullets || [];
-      a.rel = detail.rel || '';
-      a.entities = detail.entities || [];
-      a.impl = detail.impl || [];
-    } catch { /* fallback to basic */ }
+      const d = await fetchClaudeDetail(a, S.query, apiKey);
+      a.bullets = d.bullets||[]; a.rel = d.rel||''; a.impl = d.impl||[];
+    } catch { a.bullets=[a.snippet||'']; a.rel=''; a.impl=[]; }
+  } else {
+    // API 키 없으면 snippet 문장 분리
+    const snip = a.snippet||'';
+    const sents = snip.split(/(?<=[.!?。])\s+/).filter(s=>s.length>15).slice(0,4);
+    a.bullets = sents.length>=2 ? sents : (snip?[snip]:[]);
+    a.rel=''; a.impl=[];
   }
-
-  // 기본 분석 (API 없거나 실패 시)
-  if (!a.bullets) {
-    const words = tokenize(a.title + ' ' + a.snippet);
-    a.bullets = [
-      `제목: ${a.title}`,
-      a.snippet ? `내용 요약: ${a.snippet.substring(0, 120)}` : '스니펫 없음',
-      `출처: ${a.source}`,
-      `보도 시점: ${relTime(a.publishedAt)}`
-    ];
-    a.rel = `'${S.query}' 키워드가 기사 내 언급됩니다.`;
-    a.entities = words.slice(0, 6);
-    a.impl = ['원문 기사를 직접 확인하여 상세 내용을 파악하세요.'];
-  }
-
   renderDetailPanel(a);
-}
-
-function renderDetailPanelLoading(a) {
-  document.getElementById('right-panel').innerHTML = `
-<button class="back-btn" id="back-btn">← 전체 이슈로 돌아가기</button>
-<div class="d-box">
-  <div class="d-meta"><span class="d-src">${a.source}</span><span class="cdot">•</span><span class="d-time">${relTime(a.publishedAt)}</span></div>
-  <div class="d-title">${a.title}</div>
-</div>
-<div class="status-box status-loading"><div class="spin"></div>Claude가 기사를 분석하고 있습니다...</div>`;
-  document.getElementById('back-btn').addEventListener('click', doBack);
 }
 
 function renderDetailPanel(a) {
   document.getElementById('right-panel').innerHTML = `
 <button class="back-btn" id="back-btn">← 전체 이슈로 돌아가기</button>
-<div class="d-box">
-  <div class="d-meta">
-    <span class="d-src">${a.source}</span>
-    <span class="cdot">•</span>
-    <span class="d-time">${relTime(a.publishedAt)}</span>
-    ${(a.tags||[]).map(renderTag).join('')}
-  </div>
-  <div class="d-title">${a.title}</div>
-  ${a.url !== '#' ? `<a class="d-link" href="${a.url}" target="_blank" rel="noopener">원문 보기 ↗</a>` : ''}
-</div>
-${(a.bullets||[]).length ? `<div class="d-box">
-  <span class="sec-lbl">핵심 요약</span>
+${a.bullets?.length ? `<div class="d-box">
+  <span class="sec-lbl">내용 요약</span>
   ${a.bullets.map((b,i)=>`<div class="b-item"><span class="b-num">${String(i+1).padStart(2,'0')}</span>${b}</div>`).join('')}
-</div>` : ''}
-${a.rel ? `<div class="rel-box"><span class="rel-lbl">왜 관련이 있나</span><div class="rel-text">${a.rel}</div></div>` : ''}
-${(a.entities||[]).length ? `<div class="d-box">
-  <span class="sec-lbl">핵심 등장 주체</span>
-  <div class="entity-wrap">${a.entities.map(e=>`<span class="chip">${e}</span>`).join('')}</div>
-</div>` : ''}
-${(a.impl||[]).length ? `<div class="d-box">
-  <span class="sec-lbl">시사점 및 전망</span>
-  ${a.impl.map(i=>`<div class="impl-item"><div class="impl-dot"></div><div class="impl-text">${i}</div></div>`).join('')}
-</div>` : ''}`;
-
+</div>` : `<div class="d-box"><div style="font-size:13px;color:var(--t2);line-height:1.7">${a.snippet||'내용 없음'}</div></div>`}
+${a.rel ? `<div class="rel-box"><span class="rel-lbl">이 기사와 "${S.query}"의 연관성</span><div class="rel-text">${a.rel}</div></div>` : ''}
+${a.impl?.length ? `<div class="d-box"><span class="sec-lbl">시사점</span>${a.impl.map(i=>`<div class="impl-item"><div class="impl-dot"></div><div class="impl-text">${i}</div></div>`).join('')}</div>` : ''}
+${a.url&&a.url!=='#'?`<a class="d-link" href="${a.url}" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--ac);margin-top:4px">원문 보기 ↗</a>`:''}`;
   document.getElementById('back-btn').addEventListener('click', doBack);
 }
 
@@ -829,117 +640,65 @@ function doBack() {
   document.getElementById('panel-lbl').textContent = '핵심 이슈 분석';
 }
 
-function setStatus(html) {
-  document.getElementById('fetch-status').innerHTML = html;
-}
-
-// ═══════════════════════════════════════════════
-//  MAIN SEARCH FLOW
-// ═══════════════════════════════════════════════
+// ─── MAIN SEARCH ───
 async function loadResults(query) {
-  query = query.trim();
-  if (!query) return;
-
-  // 화면 전환
-  document.getElementById('home-page').style.display = 'none';
-  document.getElementById('results-page').style.display = 'block';
-  document.getElementById('main-nav').style.display = 'flex';
-  document.getElementById('nav-input').value = query;
-
-  // 상태 초기화
-  S.query = query; S.articles = []; S.issues = []; S.summary = '';
-  S.selectedId = null; S.sort = 'relevance';
-  document.getElementById('sort-rel').className = 'sort-btn active';
-  document.getElementById('sort-date').className = 'sort-btn';
-  document.getElementById('q-keyword').textContent = `"${query}"`;
-  document.getElementById('q-time').textContent = `— ${new Date().toLocaleString('ko-KR',{month:'long',day:'numeric',hour:'2-digit',minute:'2-digit'})} 기준`;
-  document.getElementById('art-count').textContent = '';
-  document.getElementById('panel-lbl').textContent = '핵심 이슈 분석';
-
-  renderSkeletonCards(8);
-  renderIssueSkeleton();
-  setStatus(`<div class="status-box status-loading"><div class="spin"></div>Google 뉴스에서 <strong>"${query}"</strong> 기사를 수집 중입니다 (rss2json → 프록시 → GNews 순 시도)...</div>`);
-
+  query = query.trim(); if (!query) return;
+  S.query=query; S.articles=[]; S.issues=[]; S.summary=''; S.selectedId=null; S.sort='relevance';
+  document.getElementById('home-page').style.display='none';
+  document.getElementById('results-page').style.display='block';
+  document.getElementById('main-nav').style.display='flex';
+  document.getElementById('nav-input').value=query;
+  document.getElementById('q-keyword').textContent=`"${query}"`;
+  document.getElementById('q-time').textContent=`— ${new Date().toLocaleString('ko-KR',{month:'long',day:'numeric',hour:'2-digit',minute:'2-digit'})} 기준`;
+  document.getElementById('art-count').textContent='';
+  document.getElementById('sort-rel').className='sort-btn active';
+  document.getElementById('sort-date').className='sort-btn';
+  document.getElementById('panel-lbl').textContent='핵심 이슈 분석';
+  renderSkeletonCards(8); renderIssueSkeleton();
+  setStatus(`<div class="status-box status-loading"><div class="spin"></div>뉴스 수집 중...</div>`);
   const apiKey = document.getElementById('api-key-input').value.trim();
 
-  // 1. RSS 뉴스 수집
   try {
     S.articles = await fetchRSSNews(query, 40);
-    document.getElementById('art-count').textContent = `${S.articles.length}개 기사`;
-    setStatus('');
-    renderArticleCards();
-  } catch (e) {
-    setStatus(`<div class="status-box status-error">⚠ 뉴스 수집 실패: ${e.message}<br><small style="opacity:.8">네트워크 상태를 확인하거나 잠시 후 재시도하세요.</small><br><button onclick="loadResults('${query}')" style="margin-top:8px;padding:5px 14px;background:#991B1B;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-family:inherit">↺ 다시 시도</button></div>`);
-    document.getElementById('articles-container').innerHTML = '';
-    renderIssueSkeleton(); // keep skeleton visible while we stop
-    return;
+    document.getElementById('art-count').textContent=`${S.articles.length}개 기사`;
+    setStatus(''); renderArticleCards();
+  } catch(e) {
+    setStatus(`<div class="status-box status-error">⚠ ${e.message} <button onclick="loadResults('${query.replace(/'/g,"\\'")}'); " style="margin-left:10px;padding:3px 10px;background:#991B1B;color:#fff;border:none;border-radius:5px;cursor:pointer;font-size:11px">↺ 재시도</button></div>`);
+    document.getElementById('articles-container').innerHTML=''; return;
   }
 
-  // 2. 이슈 분석 (Claude API 또는 로컬)
   if (apiKey) {
-    setStatus(`<div class="status-box status-loading"><div class="spin"></div>Claude AI가 이슈를 분석하고 있습니다...</div>`);
+    setStatus(`<div class="status-box status-loading"><div class="spin"></div>Claude AI 이슈 분석 중...</div>`);
     try {
-      const result = await fetchClaudeIssues(query, S.articles, apiKey);
-      S.summary = result.summary;
-      S.issues = result.issues;
-      setStatus(`<div class="status-box status-ok">✓ Claude AI 분석 완료 — ${S.issues.length}개 핵심 이슈 추출</div>`);
-      setTimeout(() => setStatus(''), 3000);
-    } catch (e) {
-      setStatus(`<div class="status-box status-error">⚠ Claude API 오류 (${e.message}). 로컬 분석으로 대체합니다.</div>`);
-      setTimeout(() => setStatus(''), 4000);
-      S.issues = extractLocalIssues(S.articles, query);
-      S.summary = buildLocalSummary(S.articles, query);
+      const r = await fetchClaudeIssues(query, S.articles, apiKey);
+      S.summary=r.summary; S.issues=r.issues;
+      setStatus(`<div class="status-box status-ok">✓ Claude AI 분석 완료 — ${S.issues.length}개 이슈 추출</div>`);
+      setTimeout(()=>setStatus(''), 3000);
+    } catch(e) {
+      setStatus(''); S.issues=extractLocalIssues(S.articles, query); S.summary=buildLocalSummary(S.articles, query);
     }
   } else {
-    // 로컬 키워드 분석
-    S.issues = extractLocalIssues(S.articles, query);
-    S.summary = buildLocalSummary(S.articles, query);
+    S.issues=extractLocalIssues(S.articles, query); S.summary=buildLocalSummary(S.articles, query);
   }
-
   renderIssuePanel();
 }
 
-// ═══════════════════════════════════════════════
-//  EVENT LISTENERS
-// ═══════════════════════════════════════════════
+// ─── EVENT LISTENERS ───
 function goHome() {
-  document.getElementById('results-page').style.display = 'none';
-  document.getElementById('home-page').style.display = 'flex';
-  document.getElementById('main-nav').style.display = 'none';
+  document.getElementById('results-page').style.display='none';
+  document.getElementById('home-page').style.display='flex';
+  document.getElementById('main-nav').style.display='none';
   document.getElementById('api-drawer').classList.remove('open');
 }
-
-document.getElementById('home-btn').addEventListener('click', () => {
-  loadResults(document.getElementById('home-input').value);
-});
-document.getElementById('home-input').addEventListener('keydown', e => {
-  if (e.key === 'Enter') loadResults(e.target.value);
-});
-document.querySelectorAll('.ex-btn').forEach(b => {
-  b.addEventListener('click', () => loadResults(b.dataset.q));
-});
+document.getElementById('home-btn').addEventListener('click', ()=>loadResults(document.getElementById('home-input').value));
+document.getElementById('home-input').addEventListener('keydown', e=>{ if(e.key==='Enter') loadResults(e.target.value); });
+document.querySelectorAll('.ex-btn').forEach(b=>b.addEventListener('click',()=>loadResults(b.dataset.q)));
 document.getElementById('nav-logo').addEventListener('click', goHome);
-document.getElementById('nav-btn').addEventListener('click', () => {
-  loadResults(document.getElementById('nav-input').value);
-});
-document.getElementById('nav-input').addEventListener('keydown', e => {
-  if (e.key === 'Enter') loadResults(e.target.value);
-});
-document.getElementById('sort-rel').addEventListener('click', () => {
-  S.sort = 'relevance';
-  document.getElementById('sort-rel').className = 'sort-btn active';
-  document.getElementById('sort-date').className = 'sort-btn';
-  renderArticleCards();
-});
-document.getElementById('sort-date').addEventListener('click', () => {
-  S.sort = 'date';
-  document.getElementById('sort-date').className = 'sort-btn active';
-  document.getElementById('sort-rel').className = 'sort-btn';
-  renderArticleCards();
-});
-document.getElementById('api-toggle').addEventListener('click', () => {
-  document.getElementById('api-drawer').classList.toggle('open');
-});
+document.getElementById('nav-btn').addEventListener('click', ()=>loadResults(document.getElementById('nav-input').value));
+document.getElementById('nav-input').addEventListener('keydown', e=>{ if(e.key==='Enter') loadResults(e.target.value); });
+document.getElementById('sort-rel').addEventListener('click', ()=>{ S.sort='relevance'; document.getElementById('sort-rel').className='sort-btn active'; document.getElementById('sort-date').className='sort-btn'; renderArticleCards(); });
+document.getElementById('sort-date').addEventListener('click', ()=>{ S.sort='date'; document.getElementById('sort-date').className='sort-btn active'; document.getElementById('sort-rel').className='sort-btn'; renderArticleCards(); });
+document.getElementById('api-toggle').addEventListener('click', ()=>document.getElementById('api-drawer').classList.toggle('open'));
 </script>
 </body>
 </html>
