@@ -49,25 +49,39 @@ BODY_SELECTORS = [
 
 GOOGLE_NEWS_RE = re.compile(r"news\.google\.com")
 
-def resolve_google_url(url, timeout=6):
+def resolve_google_url(url, timeout=8):
     """Google News 리다이렉트 URL → 실제 기사 URL"""
     if not GOOGLE_NEWS_RE.search(url):
         return url
     try:
-        # allow_redirects=False 로 Location 헤더에서 실제 URL 추출
-        r = requests.head(url, headers=CRAWL_HEADERS, timeout=timeout, allow_redirects=False)
-        location = r.headers.get("Location") or r.headers.get("location", "")
-        if location and location.startswith("http") and "google.com" not in location:
-            print(f"[resolve] {url[:60]} → {location[:80]}")
-            return location
-        # HEAD가 안되면 GET으로 리다이렉트 따라가기
-        r2 = requests.get(url, headers=CRAWL_HEADERS, timeout=timeout, allow_redirects=True)
-        if r2.url != url and "google.com" not in r2.url:
-            print(f"[resolve] GET redirect → {r2.url[:80]}")
-            return r2.url
+        # allow_redirects=True + 히스토리에서 최종 non-google URL 추출
+        r = requests.get(url, headers=CRAWL_HEADERS, timeout=timeout, allow_redirects=True)
+        # 리다이렉트 체인에서 구글이 아닌 첫 번째 URL 찾기
+        for resp in r.history:
+            loc = resp.headers.get("Location","")
+            if loc and "google.com" not in loc and loc.startswith("http"):
+                print(f"[resolve] history → {loc[:80]}")
+                return loc
+        # 최종 URL이 구글이 아니면 사용
+        if r.url and "google.com" not in r.url:
+            print(f"[resolve] final → {r.url[:80]}")
+            return r.url
+        # HTML에서 meta refresh / canonical URL 추출 시도
+        if r.ok and r.text:
+            m = re.search(r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+content=["\'][^"\']*url=([^"\'>\s]+)', r.text, re.I)
+            if m:
+                loc = m.group(1).strip()
+                print(f"[resolve] meta-refresh → {loc[:80]}")
+                return loc
+            m2 = re.search(r'window\.location\s*=\s*["\']([^"\']+)["\']', r.text)
+            if m2:
+                loc = m2.group(1).strip()
+                print(f"[resolve] js-redirect → {loc[:80]}")
+                return loc
     except Exception as e:
-        print(f"[resolve] failed: {e}")
-    return url
+        print(f"[resolve] error: {e}")
+    print(f"[resolve] could not resolve: {url[:60]}")
+    return ""  # 빈 문자열 반환 → 크롤링 스킵
 
 def crawl_body(url, timeout=8):
     """기사 URL → 본문 텍스트"""
@@ -75,6 +89,8 @@ def crawl_body(url, timeout=8):
         return ""
     # Google News URL이면 실제 URL로 변환
     real_url = resolve_google_url(url, timeout=6)
+    if not real_url:
+        return ""
     print(f"[crawl] fetching: {real_url[:80]}")
     try:
         resp = requests.get(real_url, headers=CRAWL_HEADERS, timeout=timeout, allow_redirects=True)
@@ -238,28 +254,34 @@ def api_analyze():
         )
 
     content_str = "\n\n---\n\n".join(blocks)
+    has_body = any(bodies.get(a["id"],"") for a in arts[:8])
 
     prompt = """당신은 한국 경제/금융 뉴스 애널리스트입니다.
-검색 주제: "{}"
+검색 주제: "{query}"
 
-아래는 실제 기사 내용입니다:
+아래 기사들을 분석하세요:
 
-{}
+{content}
 
-위 기사 내용만을 근거로 JSON을 반환하세요 (마크다운 없이):
+JSON만 반환 (마크다운 없이):
 {{
-  "overallSummary": "3문장. 기사에서 확인된 사실만. 구체적 기업명/수치/날짜 포함. 추측 금지.",
+  "overallSummary": "'{query}'를 둘러싼 현재 상황 3문장. {body_note}",
   "mainIssues": [
     {{
       "id": "i1",
       "title": "이슈 제목 20자 이내",
-      "desc": "이 이슈의 내용과 중요성 2~3문장. 반드시 기사 본문 근거. 없는 내용 지어내기 금지.",
+      "desc": "이 이슈의 내용과 시장·투자자 관점 의미 2~3문장. {body_note}",
       "refs": ["기사id"],
       "sev": "high|medium|low"
     }}
   ]
 }}
-한국어. 3~5개 이슈.""".format(query, content_str)
+한국어. 3~5개 이슈.""".format(
+        query=query,
+        content=content_str,
+        body_note="기사 본문에서 확인된 구체적 사실(기업명·수치·날짜)만 사용. 추측·지어내기 금지." if has_body
+                  else "기사 제목에서 파악되는 사실만 서술. 확인 안된 내용 절대 추가 금지."
+    )
 
     try:
         parsed = json.loads(call_llm(prompt, 1500))
