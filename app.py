@@ -1,121 +1,125 @@
 """
 IssueScope
-환경변수:
-  ANTHROPIC_API_KEY  (Claude - 선택)
-  GEMINI_API_KEY     (Google Gemini Flash - 선택, 무료)
-  NAVER_CLIENT_ID / NAVER_CLIENT_SECRET (뉴스 수집 - 선택)
+환경변수: GEMINI_API_KEY (분석), NEWSAPI_KEY (뉴스 수집)
 """
-import os, re, json, xml.etree.ElementTree as ET
+import os, re, json
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
-
-CLAUDE_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
 GEMINI_KEY  = os.environ.get("GEMINI_API_KEY", "")
-NAVER_ID    = os.environ.get("NAVER_CLIENT_ID", "")
-NAVER_SEC   = os.environ.get("NAVER_CLIENT_SECRET", "")
+CLAUDE_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
+NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY", "")
 
-# 사용할 LLM 자동 선택 (Gemini 우선 - 무료)
 def get_llm():
-    if GEMINI_KEY:   return "gemini"
-    if CLAUDE_KEY:   return "claude"
+    if GEMINI_KEY: return "gemini"
+    if CLAUDE_KEY: return "claude"
     return None
 
-RSS_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/rss+xml, text/xml, */*",
-    "Accept-Language": "ko-KR,ko;q=0.9",
-    "Referer": "https://news.google.com/",
-}
 CRAWL_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
-    "Accept-Language": "ko-KR,ko;q=0.9",
+    "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.google.com/",
 }
 
-# ─── 크롤링 ──────────────────────────────────────────────────────────────────
+# ─── 뉴스 수집: NewsAPI.org ─────────────────────────────────────────────────
+
+def fetch_newsapi(query, max_items=30):
+    if not NEWSAPI_KEY:
+        raise ValueError("NEWSAPI_KEY 미설정")
+    resp = requests.get(
+        "https://newsapi.org/v2/everything",
+        params={
+            "q": query,
+            "language": "en",
+            "sortBy": "publishedAt",
+            "pageSize": min(max_items, 100),
+            "apiKey": NEWSAPI_KEY,
+        },
+        timeout=12,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("status") != "ok":
+        raise ValueError(data.get("message","NewsAPI error"))
+    arts = data.get("articles") or []
+    if not arts:
+        raise ValueError("No results")
+    items = []
+    for a in arts:
+        if a.get("title","") == "[Removed]":
+            continue
+        items.append({
+            "title": a.get("title",""),
+            "source": (a.get("source") or {}).get("name","Unknown"),
+            "url": a.get("url",""),
+            "publishedAt": a.get("publishedAt",""),
+            "description": (a.get("description") or "")[:400],
+            "content": (a.get("content") or "")[:500],
+        })
+    print(f"[newsapi] Got {len(items)} articles for '{query}'")
+    return items
+
+@app.route("/api/news")
+def api_news():
+    q = request.args.get("q","").strip()
+    if not q:
+        return jsonify({"error":"q required","items":[]}), 400
+    try:
+        items = fetch_newsapi(q)
+        return jsonify({"items": items, "source": "newsapi"})
+    except Exception as e:
+        return jsonify({"error": str(e), "items": []}), 500
+
+# ─── 크롤링 ─────────────────────────────────────────────────────────────────
 
 BODY_SELECTORS = [
-    "#dic_area", "#articleBodyContents", "#articleBody",
-    "#article-view-content-div", "#newsct_article",
-    ".article_view", ".article-content", ".article_content",
-    ".view_cont", "#articeBody", "#newsBody",
-    "[itemprop='articleBody']", "article",
+    "article", "[itemprop='articleBody']",
+    ".article-body", ".article-content", ".article__body",
+    ".story-body", ".story-content",
+    ".post-content", ".entry-content",
+    "#article-body", "#story", ".caas-body",
+    "main",
 ]
 
-GOOGLE_NEWS_RE = re.compile(r"news\.google\.com")
-
-def resolve_google_url(url, timeout=8):
-    """Google News URL이면 스킵, 아니면 그대로 반환"""
-    if not url:
-        return ""
-    if GOOGLE_NEWS_RE.search(url):
-        # RSS description에서 이미 실제 URL을 추출했어야 함
-        # 혹시 구글 URL이 오면 GET으로 한 번 더 시도
-        try:
-            r = requests.get(url, headers=CRAWL_HEADERS, timeout=timeout, allow_redirects=True)
-            for resp in r.history:
-                loc = resp.headers.get("Location","")
-                if loc and "google.com" not in loc and loc.startswith("http"):
-                    return loc
-            if "google.com" not in r.url:
-                return r.url
-            # HTML에서 실제 URL 추출 시도
-            urls = re.findall(r'href="(https?://(?!news\.google\.com)[^"]+)"', r.text)
-            if urls:
-                return urls[0]
-        except Exception as e:
-            print(f"[resolve] error: {e}")
-        return ""
-    return url
-
 def crawl_body(url, timeout=8):
-    """기사 URL → 본문 텍스트"""
     if not url or url == "#":
         return ""
-    # Google News URL이면 실제 URL로 변환
-    real_url = resolve_google_url(url, timeout=6)
-    if not real_url:
-        return ""
-    print(f"[crawl] fetching: {real_url[:80]}")
     try:
-        resp = requests.get(real_url, headers=CRAWL_HEADERS, timeout=timeout, allow_redirects=True)
+        resp = requests.get(url, headers=CRAWL_HEADERS, timeout=timeout, allow_redirects=True)
         if not resp.ok or len(resp.text) < 500:
-            print(f"[crawl] failed: {resp.status_code}")
+            print(f"[crawl] {resp.status_code} for {url[:60]}")
             return ""
         soup = BeautifulSoup(resp.text, "lxml")
-        for tag in soup(["script","style","nav","header","footer","aside","iframe","noscript","figure"]):
+        for tag in soup(["script","style","nav","header","footer","aside","iframe","noscript","figure","figcaption"]):
             tag.decompose()
         for sel in BODY_SELECTORS:
             el = soup.select_one(sel)
             if el:
                 t = re.sub(r"\s+", " ", el.get_text()).strip()
-                if len(t) > 200:
-                    print(f"[crawl] got {len(t)} chars via '{sel}'")
-                    return t[:3000]
-        # fallback: p 태그
-        paras = [p.get_text().strip() for p in soup.find_all("p") if len(p.get_text().strip()) > 50]
+                if len(t) > 300:
+                    print(f"[crawl] {len(t)} chars via '{sel}' from {url[:50]}")
+                    return t[:4000]
+        paras = [p.get_text().strip() for p in soup.find_all("p") if len(p.get_text().strip()) > 40]
         if paras:
-            text = re.sub(r"\s+", " ", " ".join(paras[:12]))[:3000]
-            print(f"[crawl] got {len(text)} chars via <p> tags")
+            text = re.sub(r"\s+", " ", " ".join(paras[:15]))[:4000]
+            print(f"[crawl] {len(text)} chars via <p> from {url[:50]}")
             return text
-        print("[crawl] no body found")
+        print(f"[crawl] no body from {url[:50]}")
     except Exception as e:
-        print(f"[crawl] error: {e}")
+        print(f"[crawl] error {e} for {url[:50]}")
     return ""
 
 def crawl_parallel(articles, n=8):
-    """상위 n개 기사 병렬 크롤링"""
     results = {}
     def fetch(a):
         return a["id"], crawl_body(a.get("url",""))
     with ThreadPoolExecutor(max_workers=6) as ex:
         futs = {ex.submit(fetch, a): a["id"] for a in articles[:n]}
-        for f in as_completed(futs, timeout=15):
+        for f in as_completed(futs, timeout=20):
             try:
                 aid, body = f.result()
                 results[aid] = body
@@ -123,94 +127,16 @@ def crawl_parallel(articles, n=8):
                 pass
     return results
 
-# ─── 뉴스 수집 ──────────────────────────────────────────────────────────────
-
-def clean(text):
-    if not text: return ""
-    text = re.sub(r"<[^>]+>", "", text)
-    for h, r in [("&lt;","<"),("&gt;",">"),("&amp;","&"),("&quot;",'"'),("&#39;","'"),("&nbsp;"," ")]:
-        text = text.replace(h, r)
-    return re.sub(r"\s+", " ", text).strip()
-
-def fetch_google_rss(query, max_items=40):
-    # 영어 뉴스 RSS (description에 실제 기사 URL이 HTML entity로 포함됨)
-    url = "https://news.google.com/rss/search?q={}&hl=en-US&gl=US&ceid=US:en".format(
-        requests.utils.quote(query))
-    resp = requests.get(url, headers=RSS_HEADERS, timeout=12)
-    resp.raise_for_status()
-    root = ET.fromstring(resp.content)
-    items = []
-    for i, item in enumerate(root.findall(".//item")[:max_items]):
-        raw = item.findtext("title") or ""
-        title = re.sub(r" - [^-]+$", "", clean(raw)).strip()
-        if not title: continue
-
-        # description은 HTML entity encoded → ET가 자동 디코딩
-        desc_raw = item.findtext("description") or ""
-
-        if i < 2:
-            print(f"[rss-debug] desc: {repr(desc_raw[:300])}")
-
-        # 실제 기사 URL 추출 (google/lh3/gstatic 제외)
-        real_urls = re.findall(
-            r'href="(https?://(?!(?:news\.google|lh3\.google|google\.|gstatic\.)[^"]*)[^"]+)"',
-            desc_raw)
-        link = real_urls[0] if real_urls else ""
-
-        pub = item.findtext("pubDate") or ""
-        # description에서 텍스트만 추출
-        desc_text = re.sub(r"<[^>]+>", "", desc_raw).strip()[:200]
-
-        src_el = item.find("source")
-        source = (src_el.text.strip() if src_el is not None and src_el.text
-                  else (re.search(r" - ([^-]+)$", raw) or [None,"알 수 없음"])[1])
-
-        print(f"[rss] '{title[:45]}' → {link[:70] or 'NO URL'}")
-        items.append({"title":title,"source":source,"url":link,
-                      "publishedAt":pub,"description":desc_text})
-    return items
-
-def fetch_naver(query, n=20):
-    if not NAVER_ID: raise ValueError("no naver key")
-    resp = requests.get(
-        "https://openapi.naver.com/v1/search/news.json",
-        params={"query":query,"display":n,"sort":"date"},
-        headers={"X-Naver-Client-Id":NAVER_ID,"X-Naver-Client-Secret":NAVER_SEC},
-        timeout=10)
-    resp.raise_for_status()
-    items = []
-    for a in resp.json().get("items",[]):
-        host = re.search(r"https?://([^/]+)", a.get("originallink","") or "")
-        items.append({
-            "title": clean(a.get("title","")),
-            "source": host.group(1) if host else "네이버뉴스",
-            "url": a.get("originallink") or a.get("link",""),
-            "publishedAt": a.get("pubDate",""),
-            "description": clean(a.get("description",""))[:400],
-        })
-    return items
-
-@app.route("/api/news")
-def api_news():
-    q = request.args.get("q","").strip()
-    if not q: return jsonify({"error":"q 필요","items":[]}), 400
-    try: return jsonify({"items": fetch_google_rss(q), "source":"google"})
-    except Exception: pass
-    try: return jsonify({"items": fetch_naver(q), "source":"naver"})
-    except Exception as e: return jsonify({"error":str(e),"items":[]}), 500
-
-# ─── LLM 호출 ────────────────────────────────────────────────────────────────
+# ─── LLM ─────────────────────────────────────────────────────────────────────
 
 def call_gemini(prompt, max_tokens=1500):
-    """Google Gemini 2.0 Flash - 무료, 빠름"""
     url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={}".format(GEMINI_KEY)
     resp = requests.post(url,
         json={"contents":[{"parts":[{"text": prompt}]}],
               "generationConfig":{"maxOutputTokens": max_tokens, "temperature": 0.3}},
         timeout=40)
     resp.raise_for_status()
-    data = resp.json()
-    text = data["candidates"][0]["content"]["parts"][0]["text"]
+    text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
     return text.replace("```json","").replace("```","").strip()
 
 def call_claude(prompt, max_tokens=1500):
@@ -227,7 +153,7 @@ def call_llm(prompt, max_tokens=1500):
     llm = get_llm()
     if llm == "gemini": return call_gemini(prompt, max_tokens)
     if llm == "claude": return call_claude(prompt, max_tokens)
-    raise ValueError("LLM 키 없음 - GEMINI_API_KEY 또는 ANTHROPIC_API_KEY 설정 필요")
+    raise ValueError("No LLM key set - add GEMINI_API_KEY or ANTHROPIC_API_KEY")
 
 # ─── 분석 API ────────────────────────────────────────────────────────────────
 
@@ -237,68 +163,63 @@ def api_analyze():
     query = body.get("query","").strip()
     arts  = body.get("articles",[])
     if not query or not arts:
-        return jsonify({"error":"query, articles 필요"}), 400
+        return jsonify({"error":"query, articles required"}), 400
 
-    # 1단계: 상위 8개 기사 본문 크롤링
-    print(f"[analyze] Crawling {min(len(arts),8)} articles for '{query}'...")
-    bodies = crawl_parallel(arts, n=8)
+    # 상위 8개 기사 본문 크롤링
+    top = arts[:8]
+    print(f"[analyze] Crawling {len(top)} articles for '{query}'...")
+    bodies = crawl_parallel(top, n=8)
     success = sum(1 for v in bodies.values() if v)
-    print(f"[analyze] Crawled: {success}/{min(len(arts),8)} articles got body text")
+    print(f"[analyze] Crawled: {success}/{len(top)} got body text")
 
-    # 2단계: 각 기사 콘텐츠 구성
     blocks = []
-    for a in arts[:8]:
+    for a in top:
         body_text = bodies.get(a["id"],"").strip()
-        content   = body_text or a.get("description","") or ""
-        label     = "본문" if len(body_text) > 100 else "요약"
-        blocks.append(
-            "[{}] {} ({})\n{}: {}".format(
-                a["id"], a["title"], a["source"], label,
-                content[:1500] if content else "(내용 없음)"
-            )
-        )
+        # NewsAPI content (260 chars) as middle fallback
+        api_content = a.get("content","").strip()
+        desc = a.get("description","").strip()
+        content = body_text or api_content or desc or ""
+        label = "FULL" if len(body_text) > 300 else ("PARTIAL" if content else "TITLE ONLY")
+        blocks.append("[{}] {} ({})\n[{}] {}".format(
+            a["id"], a["title"], a["source"], label,
+            content[:2000] if content else a["title"]))
 
     content_str = "\n\n---\n\n".join(blocks)
-    has_body = any(bodies.get(a["id"],"") for a in arts[:8])
 
-    prompt = """당신은 한국 경제/금융 뉴스 애널리스트입니다.
-검색 주제: "{query}"
+    prompt = """You are a financial/tech news analyst.
+Topic: "{}"
 
-아래 기사들을 분석하세요:
+Articles:
 
-{content}
+{}
 
-JSON만 반환 (마크다운 없이):
+Return JSON only (no markdown):
 {{
-  "overallSummary": "'{query}'를 둘러싼 현재 상황 3문장. {body_note}",
+  "overallSummary": "3 sentences. What is happening right now around '{}'. Use specific facts from articles only. No speculation.",
   "mainIssues": [
     {{
       "id": "i1",
-      "title": "이슈 제목 20자 이내",
-      "desc": "이 이슈의 내용과 시장·투자자 관점 의미 2~3문장. {body_note}",
-      "refs": ["기사id"],
+      "title": "Issue title (max 8 words)",
+      "desc": "2-3 sentences explaining this issue and why it matters. Based on article content only.",
+      "refs": ["article_ids"],
       "sev": "high|medium|low"
     }}
   ]
 }}
-한국어. 3~5개 이슈.""".format(
-        query=query,
-        content=content_str,
-        body_note="기사 본문에서 확인된 구체적 사실(기업명·수치·날짜)만 사용. 추측·지어내기 금지." if has_body
-                  else "기사 제목에서 파악되는 사실만 서술. 확인 안된 내용 절대 추가 금지."
-    )
+3-5 issues. English.""".format(query, content_str, query)
 
     try:
         parsed = json.loads(call_llm(prompt, 1500))
         return jsonify({
             "summary": parsed.get("overallSummary",""),
-            "issues":  [{"id":x.get("id",""),"title":x.get("title",""),
-                         "desc":x.get("desc") or x.get("description",""),
-                         "refs":x.get("refs",[]),"sev":x.get("sev","medium")}
-                        for x in parsed.get("mainIssues",[])]
+            "issues": [{"id":x.get("id",""),"title":x.get("title",""),
+                        "desc":x.get("desc") or x.get("description",""),
+                        "refs":x.get("refs",[]),"sev":x.get("sev","medium")}
+                       for x in parsed.get("mainIssues",[])]
         })
     except Exception as e:
-        return jsonify({"error":str(e)}), 500
+        print(f"[analyze] LLM error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/api/detail", methods=["POST"])
 def api_detail():
@@ -306,61 +227,65 @@ def api_detail():
     query  = body.get("query","")
     title  = body.get("title","")
     url    = body.get("url","")
+    snippet = body.get("snippet","")
 
-    # 기사 본문 크롤링
     print(f"[detail] Crawling: {url[:80]}")
     content = crawl_body(url)
     print(f"[detail] Got {len(content)} chars")
 
     if not content:
-        return jsonify({
-            "bullets": ["기사 본문을 가져올 수 없습니다. 원문 링크를 직접 확인해주세요."],
-            "rel": "", "impl": []
-        })
+        content = snippet or ""
+    if not content:
+        return jsonify({"bullets":["Could not fetch article. Click the link to read directly."],"rel":"","impl":[]})
 
-    prompt = """한국 경제/금융 뉴스 분석. 검색 주제: "{}"
+    prompt = """News analyst. Topic: "{}"
 
-기사 제목: {}
-기사 본문:
+Article title: {}
+Article body:
 {}
 
-JSON만 반환 (마크다운 없이):
+Return JSON only (no markdown):
 {{
-  "bullets": ["본문에서 확인된 핵심 사실 4~5개. 인물/기업/수치/날짜 포함. 본문에 없는 내용 절대 추가 금지."],
-  "rel": "'{}'와 어떻게 직접 연결되는지 1~2문장. 실제 인과관계 서술. '키워드 언급' 표현 금지.",
-  "impl": ["시사점 2~3개. 본문 근거."]
-}}
-한국어.""".format(query, title, content[:3000], query)
+  "bullets": ["4-5 key facts from the article. Specific names, numbers, dates. Only what the article says."],
+  "rel": "How this article directly connects to '{}'. Explain the actual mechanism/impact. Never say 'keyword is mentioned'.",
+  "impl": ["2-3 concrete implications or outlook points based on article content."]
+}}""".format(query, title, content[:3000], query)
 
     try:
         return jsonify(json.loads(call_llm(prompt, 1000)))
     except Exception as e:
-        return jsonify({"error":str(e)}), 500
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/api/test-crawl")
 def test_crawl():
-    """Railway 서버에서 한국 뉴스 사이트 접근 가능 여부 테스트"""
-    test_urls = [
-        "https://www.digitaltoday.co.kr",
-        "https://www.hankyung.com",
-        "https://www.mk.co.kr",
-        "https://n.news.naver.com",
-        "https://www.yna.co.kr",
+    tests = [
+        "https://www.reuters.com",
+        "https://techcrunch.com",
+        "https://www.bbc.com/news",
+        "https://www.cnbc.com",
+        "https://www.theverge.com",
     ]
     results = {}
-    for url in test_urls:
+    for u in tests:
         try:
-            r = requests.get(url, headers=CRAWL_HEADERS, timeout=6, allow_redirects=True)
-            results[url] = {"status": r.status_code, "bytes": len(r.content)}
+            r = requests.get(u, headers=CRAWL_HEADERS, timeout=6, allow_redirects=True)
+            results[u] = {"status": r.status_code, "bytes": len(r.content)}
         except Exception as e:
-            results[url] = {"error": str(e)}
+            results[u] = {"error": str(e)}
     return jsonify(results)
-    return jsonify({
-        "llm":    get_llm(),
-        "gemini": bool(GEMINI_KEY),
-        "claude": bool(CLAUDE_KEY),
-        "naver":  bool(NAVER_ID),
-    })
+
+@app.route("/api/test-url")
+def test_url():
+    url = request.args.get("url","")
+    if not url:
+        return jsonify({"error": "url param required"})
+    body = crawl_body(url)
+    return jsonify({"url": url, "body_chars": len(body), "preview": body[:500] if body else None})
+
+@app.route("/api/status")
+def api_status():
+    return jsonify({"llm": get_llm(), "gemini": bool(GEMINI_KEY),
+                    "claude": bool(CLAUDE_KEY), "newsapi": bool(NEWSAPI_KEY)})
 
 @app.route("/")
 def index():
@@ -370,37 +295,6 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     llm  = get_llm()
     print(f"\n http://localhost:{port}")
-    print(f"   LLM   : {llm or 'NONE - API key 필요'}")
-    print(f"   Naver : {'on' if NAVER_ID else 'off'}\n")
+    print(f"   LLM    : {llm or 'NONE - set GEMINI_API_KEY'}")
+    print(f"   NewsAPI: {'on' if NEWSAPI_KEY else 'off - set NEWSAPI_KEY'}\n")
     app.run(host="0.0.0.0", port=port, debug=False)
-
-@app.route("/api/test-url")
-def test_url():
-    """특정 URL 크롤링 테스트"""
-    url = request.args.get("url","")
-    if not url:
-        return jsonify({"error": "url 파라미터 필요"})
-    real_url = resolve_google_url(url)
-    try:
-        r = requests.get(real_url or url, headers=CRAWL_HEADERS, timeout=10, allow_redirects=True)
-        body = crawl_body(real_url or url)
-        return jsonify({
-            "input_url": url,
-            "resolved_url": real_url,
-            "final_url": r.url,
-            "status": r.status_code,
-            "bytes": len(r.content),
-            "body_chars": len(body),
-            "body_preview": body[:500] if body else None
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)})
-
-@app.route("/api/status")
-def api_status():
-    return jsonify({
-        "llm":    get_llm(),
-        "gemini": bool(GEMINI_KEY),
-        "claude": bool(CLAUDE_KEY),
-        "naver":  bool(NAVER_ID),
-    })
