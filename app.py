@@ -50,38 +50,28 @@ BODY_SELECTORS = [
 GOOGLE_NEWS_RE = re.compile(r"news\.google\.com")
 
 def resolve_google_url(url, timeout=8):
-    """Google News 리다이렉트 URL → 실제 기사 URL"""
-    if not GOOGLE_NEWS_RE.search(url):
-        return url
-    try:
-        # allow_redirects=True + 히스토리에서 최종 non-google URL 추출
-        r = requests.get(url, headers=CRAWL_HEADERS, timeout=timeout, allow_redirects=True)
-        # 리다이렉트 체인에서 구글이 아닌 첫 번째 URL 찾기
-        for resp in r.history:
-            loc = resp.headers.get("Location","")
-            if loc and "google.com" not in loc and loc.startswith("http"):
-                print(f"[resolve] history → {loc[:80]}")
-                return loc
-        # 최종 URL이 구글이 아니면 사용
-        if r.url and "google.com" not in r.url:
-            print(f"[resolve] final → {r.url[:80]}")
-            return r.url
-        # HTML에서 meta refresh / canonical URL 추출 시도
-        if r.ok and r.text:
-            m = re.search(r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+content=["\'][^"\']*url=([^"\'>\s]+)', r.text, re.I)
-            if m:
-                loc = m.group(1).strip()
-                print(f"[resolve] meta-refresh → {loc[:80]}")
-                return loc
-            m2 = re.search(r'window\.location\s*=\s*["\']([^"\']+)["\']', r.text)
-            if m2:
-                loc = m2.group(1).strip()
-                print(f"[resolve] js-redirect → {loc[:80]}")
-                return loc
-    except Exception as e:
-        print(f"[resolve] error: {e}")
-    print(f"[resolve] could not resolve: {url[:60]}")
-    return ""  # 빈 문자열 반환 → 크롤링 스킵
+    """Google News URL이면 스킵, 아니면 그대로 반환"""
+    if not url:
+        return ""
+    if GOOGLE_NEWS_RE.search(url):
+        # RSS description에서 이미 실제 URL을 추출했어야 함
+        # 혹시 구글 URL이 오면 GET으로 한 번 더 시도
+        try:
+            r = requests.get(url, headers=CRAWL_HEADERS, timeout=timeout, allow_redirects=True)
+            for resp in r.history:
+                loc = resp.headers.get("Location","")
+                if loc and "google.com" not in loc and loc.startswith("http"):
+                    return loc
+            if "google.com" not in r.url:
+                return r.url
+            # HTML에서 실제 URL 추출 시도
+            urls = re.findall(r'href="(https?://(?!news\.google\.com)[^"]+)"', r.text)
+            if urls:
+                return urls[0]
+        except Exception as e:
+            print(f"[resolve] error: {e}")
+        return ""
+    return url
 
 def crawl_body(url, timeout=8):
     """기사 URL → 본문 텍스트"""
@@ -153,15 +143,24 @@ def fetch_google_rss(query, max_items=40):
         raw = item.findtext("title") or ""
         title = re.sub(r" - [^-]+$", "", clean(raw)).strip()
         if not title: continue
-        link = ""
-        for child in item:
-            if child.tag == "link":
-                link = (child.tail or child.text or "").strip(); break
+
+        # description HTML 안에 실제 기사 URL이 있음
+        desc_raw = item.findtext("description") or ""
+        real_urls = re.findall(
+            r'href="(https?://(?!news\.google\.com)[^"]+)"', desc_raw)
+        link = real_urls[0] if real_urls else ""
+        # fallback: <link> 태그 (구글 리다이렉트 URL)
+        if not link:
+            for child in item:
+                if child.tag == "link":
+                    link = (child.tail or child.text or "").strip(); break
+
         pub = item.findtext("pubDate") or ""
-        desc = clean(item.findtext("description") or "")[:200]
+        desc = clean(desc_raw)[:200]
         src_el = item.find("source")
         source = (src_el.text.strip() if src_el is not None and src_el.text
                   else (re.search(r" - ([^-]+)$", raw) or [None,"알 수 없음"])[1])
+        print(f"[rss] '{title[:40]}' → {link[:60]}")
         items.append({"title":title,"source":source,"url":link,"publishedAt":pub,"description":desc})
     return items
 
