@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 app = Flask(__name__)
 GEMINI_KEY  = os.environ.get("GEMINI_API_KEY", "")
 CLAUDE_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
-NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY", "")
+NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY","") or os.environ.get("NEWS_API_KEY","")
 
 def get_llm():
     if GEMINI_KEY: return "gemini"
@@ -166,9 +166,9 @@ def api_analyze():
         return jsonify({"error":"query, articles required"}), 400
 
     # 상위 8개 기사 본문 크롤링
-    top = arts[:8]
+    top = arts[:10]
     print(f"[analyze] Crawling {len(top)} articles for '{query}'...")
-    bodies = crawl_parallel(top, n=8)
+    bodies = crawl_parallel(top, n=10)
     success = sum(1 for v in bodies.values() if v)
     print(f"[analyze] Crawled: {success}/{len(top)} got body text")
 
@@ -186,30 +186,37 @@ def api_analyze():
 
     content_str = "\n\n---\n\n".join(blocks)
 
-    prompt = """You are a financial/tech news analyst.
-Topic: "{}"
+    prompt = """You are a senior investigative journalist and analyst. You have been given {n} articles about "{query}".
 
-Articles:
+Your job: Read every article carefully. Then produce a REAL analysis — not a list of headlines, not a generic summary. Tell me what is ACTUALLY happening, who the key players are, what the conflicts are, what the stakes are, and what might happen next.
 
-{}
+ARTICLES:
+{content}
 
-Return JSON only (no markdown):
+Return JSON only (no markdown, no commentary):
 {{
-  "overallSummary": "3 sentences. What is happening right now around '{}'. Use specific facts from articles only. No speculation.",
+  "overallSummary": "Write 5-8 sentences. This must read like the opening of a deeply researched briefing document. Start with the single most important development. Then explain the broader context. Include specific company names, dollar amounts, dates, percentages — whatever the articles contain. Explain WHY this matters to investors/industry/public. End with the key tension or unresolved question. Do NOT just list article titles. Do NOT use phrases like 'several articles discuss' or 'multiple sources report'. Write as if you are briefing a CEO.",
   "mainIssues": [
     {{
       "id": "i1",
-      "title": "Issue title (max 8 words)",
-      "desc": "2-3 sentences explaining this issue and why it matters. Based on article content only.",
-      "refs": ["article_ids"],
+      "title": "Crisp issue title, max 8 words",
+      "desc": "4-6 sentences. Explain: (1) What specifically happened (2) Who is involved and what are their positions (3) Why this matters — financial impact, regulatory implications, competitive dynamics, or public consequences (4) What to watch next. Use concrete facts from the articles. No filler, no generic statements.",
+      "refs": ["article_ids that support this issue"],
       "sev": "high|medium|low"
     }}
   ]
 }}
-3-5 issues. English.""".format(query, content_str, query)
+
+RULES:
+- 4-6 issues, each with substantial descriptions
+- Every claim must come from the articles provided
+- If articles contain numbers, quotes, or dates — USE THEM
+- Do not pad with generic observations
+- Write in English
+""".format(n=len(top), query=query, content=content_str)
 
     try:
-        parsed = json.loads(call_llm(prompt, 1500))
+        parsed = json.loads(call_llm(prompt, 3000))
         return jsonify({
             "summary": parsed.get("overallSummary",""),
             "issues": [{"id":x.get("id",""),"title":x.get("title",""),
@@ -238,21 +245,27 @@ def api_detail():
     if not content:
         return jsonify({"bullets":["Could not fetch article. Click the link to read directly."],"rel":"","impl":[]})
 
-    prompt = """News analyst. Topic: "{}"
+    prompt = """You are a senior analyst producing a briefing on this article.
 
-Article title: {}
-Article body:
-{}
+Search topic: "{query}"
+Article title: {title}
+Article text ({chars} characters):
+{content}
 
-Return JSON only (no markdown):
+Read the ENTIRE article carefully. Then return JSON only (no markdown):
 {{
-  "bullets": ["4-5 key facts from the article. Specific names, numbers, dates. Only what the article says."],
-  "rel": "How this article directly connects to '{}'. Explain the actual mechanism/impact. Never say 'keyword is mentioned'.",
-  "impl": ["2-3 concrete implications or outlook points based on article content."]
-}}""".format(query, title, content[:3000], query)
+  "bullets": [
+    "Write 5-10 bullet points. Each bullet should be a COMPLETE sentence (15-30 words). Cover every major point in the article — key facts, decisions, numbers, quotes, context, and implications. Do NOT just restate the headline. Do NOT truncate. Do NOT skip important details. Go through the article paragraph by paragraph and extract what matters."
+  ],
+  "rel": "2-3 sentences explaining exactly how this article connects to '{query}'. Describe the specific mechanism: Does it affect pricing? Regulation? Competition? Supply chain? Investment flows? Consumer behavior? Be concrete.",
+  "impl": [
+    "3-4 forward-looking implications. What does this mean for the market, for competitors, for investors, for policy? Each should be a specific, actionable insight — not generic filler like 'this could have major implications'."
+  ]
+}}
+""".format(query=query, title=title, chars=len(content), content=content[:4000])
 
     try:
-        return jsonify(json.loads(call_llm(prompt, 1000)))
+        return jsonify(json.loads(call_llm(prompt, 2000)))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
