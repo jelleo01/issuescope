@@ -1,18 +1,28 @@
 """
 IssueScope
-환경변수: ANTHROPIC_API_KEY (필수), GNEWS_KEY (선택), NAVER_CLIENT_ID / NAVER_CLIENT_SECRET (선택)
+환경변수:
+  ANTHROPIC_API_KEY  (Claude - 선택)
+  GEMINI_API_KEY     (Google Gemini Flash - 선택, 무료)
+  NAVER_CLIENT_ID / NAVER_CLIENT_SECRET (뉴스 수집 - 선택)
 """
 import os, re, json, xml.etree.ElementTree as ET
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
+
 CLAUDE_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
+GEMINI_KEY  = os.environ.get("GEMINI_API_KEY", "")
 NAVER_ID    = os.environ.get("NAVER_CLIENT_ID", "")
 NAVER_SEC   = os.environ.get("NAVER_CLIENT_SECRET", "")
-MODEL       = "claude-haiku-4-5-20251001"
+
+# 사용할 LLM 자동 선택 (Gemini 우선 - 무료)
+def get_llm():
+    if GEMINI_KEY:   return "gemini"
+    if CLAUDE_KEY:   return "claude"
+    return None
 
 RSS_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
@@ -20,78 +30,58 @@ RSS_HEADERS = {
     "Accept-Language": "ko-KR,ko;q=0.9",
     "Referer": "https://news.google.com/",
 }
-ARTICLE_HEADERS = {
+CRAWL_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
     "Accept-Language": "ko-KR,ko;q=0.9",
     "Referer": "https://www.google.com/",
-    "Cache-Control": "no-cache",
 }
 
-# ─── 기사 본문 추출 ──────────────────────────────────────────────────────────
+# ─── 크롤링 ──────────────────────────────────────────────────────────────────
 
 BODY_SELECTORS = [
-    # 네이버 뉴스
-    "#dic_area", "#articleBodyContents",
-    # 한겨레, 경향, 오마이
-    ".article-text", ".article_view", ".art_txt",
-    # 조선, 중앙, 동아
-    "#article_body", ".article_body", "#news_body_id",
-    # 한경, 매경
-    "#articletxt", "#article-view-content-div", "#newsct_article",
-    # 연합뉴스
-    ".article", "#articleBody",
-    # 일반
-    "[itemprop='articleBody']", "article", ".content-body",
-    ".post-body", "#content", ".entry-content",
+    "#dic_area", "#articleBodyContents", "#articleBody",
+    "#article-view-content-div", "#newsct_article",
+    ".article_view", ".article-content", ".article_content",
+    ".view_cont", "#articeBody", "#newsBody",
+    "[itemprop='articleBody']", "article .content",
 ]
 
-def extract_body(html):
-    """HTML에서 기사 본문 추출"""
-    soup = BeautifulSoup(html, 'lxml')
-    # 불필요한 태그 제거
-    for tag in soup(['script','style','nav','header','footer','aside',
-                     'iframe','noscript','figure','figcaption','form']):
-        tag.decompose()
-
-    for sel in BODY_SELECTORS:
-        el = soup.select_one(sel)
-        if el:
-            text = re.sub(r'\s+', ' ', el.get_text()).strip()
-            if len(text) > 200:
-                return text[:3000]
-
-    # fallback: 50자 이상 <p> 태그 모으기
-    paras = [p.get_text().strip() for p in soup.find_all('p') if len(p.get_text().strip()) > 50]
-    if paras:
-        return re.sub(r'\s+', ' ', ' '.join(paras[:15]))[:3000]
-
-    return ""
-
-def fetch_article_body(url, timeout=8):
-    """기사 URL에서 본문 가져오기"""
-    if not url or url == '#':
+def crawl_body(url, timeout=8):
+    """기사 URL → 본문 텍스트"""
+    if not url or url == "#":
         return ""
     try:
-        resp = requests.get(url, headers=ARTICLE_HEADERS, timeout=timeout, allow_redirects=True)
-        if resp.ok and len(resp.text) > 500:
-            return extract_body(resp.text)
+        resp = requests.get(url, headers=CRAWL_HEADERS, timeout=timeout, allow_redirects=True)
+        if not resp.ok or len(resp.text) < 500:
+            return ""
+        soup = BeautifulSoup(resp.text, "lxml")
+        for tag in soup(["script","style","nav","header","footer","aside","iframe","noscript","figure"]):
+            tag.decompose()
+        for sel in BODY_SELECTORS:
+            el = soup.select_one(sel)
+            if el:
+                t = re.sub(r"\s+", " ", el.get_text()).strip()
+                if len(t) > 200:
+                    return t[:3000]
+        # fallback: p 태그 모음
+        paras = [p.get_text().strip() for p in soup.find_all("p") if len(p.get_text().strip()) > 50]
+        if paras:
+            return re.sub(r"\s+", " ", " ".join(paras[:12]))[:3000]
     except Exception:
         pass
     return ""
 
-def enrich_articles_parallel(articles, max_workers=6, timeout_per=8):
-    """기사 목록 본문 병렬 fetch"""
-    results = {a['id']: "" for a in articles}
-
-    def fetch_one(a):
-        return a['id'], fetch_article_body(a.get('url',''), timeout_per)
-
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(fetch_one, a): a['id'] for a in articles}
-        for fut in as_completed(futures, timeout=timeout_per + 2):
+def crawl_parallel(articles, n=8):
+    """상위 n개 기사 병렬 크롤링"""
+    results = {}
+    def fetch(a):
+        return a["id"], crawl_body(a.get("url",""))
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        futs = {ex.submit(fetch, a): a["id"] for a in articles[:n]}
+        for f in as_completed(futs, timeout=15):
             try:
-                aid, body = fut.result()
+                aid, body = f.result()
                 results[aid] = body
             except Exception:
                 pass
@@ -104,10 +94,11 @@ def clean(text):
     text = re.sub(r"<[^>]+>", "", text)
     for h, r in [("&lt;","<"),("&gt;",">"),("&amp;","&"),("&quot;",'"'),("&#39;","'"),("&nbsp;"," ")]:
         text = text.replace(h, r)
-    return text.strip()
+    return re.sub(r"\s+", " ", text).strip()
 
 def fetch_google_rss(query, max_items=40):
-    url = f"https://news.google.com/rss/search?q={requests.utils.quote(query)}&hl=ko&gl=KR&ceid=KR:ko"
+    url = "https://news.google.com/rss/search?q={}&hl=ko&gl=KR&ceid=KR:ko".format(
+        requests.utils.quote(query))
     resp = requests.get(url, headers=RSS_HEADERS, timeout=12)
     resp.raise_for_status()
     root = ET.fromstring(resp.content)
@@ -128,26 +119,23 @@ def fetch_google_rss(query, max_items=40):
         items.append({"title":title,"source":source,"url":link,"publishedAt":pub,"description":desc})
     return items
 
-def fetch_naver_news(query, max_items=20):
-    """Naver 뉴스 API - description에 본문 일부 포함"""
-    if not NAVER_ID or not NAVER_SEC:
-        raise ValueError("Naver API 키 없음")
+def fetch_naver(query, n=20):
+    if not NAVER_ID: raise ValueError("no naver key")
     resp = requests.get(
         "https://openapi.naver.com/v1/search/news.json",
-        params={"query": query, "display": max_items, "sort": "date"},
-        headers={"X-Naver-Client-Id": NAVER_ID, "X-Naver-Client-Secret": NAVER_SEC},
-        timeout=10
-    )
+        params={"query":query,"display":n,"sort":"date"},
+        headers={"X-Naver-Client-Id":NAVER_ID,"X-Naver-Client-Secret":NAVER_SEC},
+        timeout=10)
     resp.raise_for_status()
-    data = resp.json()
     items = []
-    for i, a in enumerate(data.get("items", [])):
-        title = clean(a.get("title",""))
-        desc  = clean(a.get("description",""))[:400]  # Naver는 본문 200-400자 포함
+    for a in resp.json().get("items",[]):
+        host = re.search(r"https?://([^/]+)", a.get("originallink","") or "")
         items.append({
-            "title": title, "source": clean(a.get("originallink","").split("/")[2] if a.get("originallink") else "네이버뉴스"),
+            "title": clean(a.get("title","")),
+            "source": host.group(1) if host else "네이버뉴스",
             "url": a.get("originallink") or a.get("link",""),
-            "publishedAt": a.get("pubDate",""), "description": desc
+            "publishedAt": a.get("pubDate",""),
+            "description": clean(a.get("description",""))[:400],
         })
     return items
 
@@ -155,35 +143,42 @@ def fetch_naver_news(query, max_items=20):
 def api_news():
     q = request.args.get("q","").strip()
     if not q: return jsonify({"error":"q 필요","items":[]}), 400
-    
-    # 1) Google RSS 시도
-    try:
-        items = fetch_google_rss(q)
-        return jsonify({"query":q,"items":items,"source":"google"})
+    try: return jsonify({"items": fetch_google_rss(q), "source":"google"})
     except Exception: pass
-    
-    # 2) Naver API 시도
-    try:
-        items = fetch_naver_news(q)
-        return jsonify({"query":q,"items":items,"source":"naver"})
-    except Exception as e:
-        return jsonify({"error":str(e),"items":[]}), 500
+    try: return jsonify({"items": fetch_naver(q), "source":"naver"})
+    except Exception as e: return jsonify({"error":str(e),"items":[]}), 500
 
-# ─── Claude ─────────────────────────────────────────────────────────────────
+# ─── LLM 호출 ────────────────────────────────────────────────────────────────
+
+def call_gemini(prompt, max_tokens=1500):
+    """Google Gemini 2.0 Flash - 무료, 빠름"""
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={}".format(GEMINI_KEY)
+    resp = requests.post(url,
+        json={"contents":[{"parts":[{"text": prompt}]}],
+              "generationConfig":{"maxOutputTokens": max_tokens, "temperature": 0.3}},
+        timeout=40)
+    resp.raise_for_status()
+    data = resp.json()
+    text = data["candidates"][0]["content"]["parts"][0]["text"]
+    return text.replace("```json","").replace("```","").strip()
 
 def call_claude(prompt, max_tokens=1500):
-    if not CLAUDE_KEY: raise ValueError("ANTHROPIC_API_KEY 미설정")
-    resp = requests.post(
-        "https://api.anthropic.com/v1/messages",
+    resp = requests.post("https://api.anthropic.com/v1/messages",
         headers={"Content-Type":"application/json","x-api-key":CLAUDE_KEY,"anthropic-version":"2023-06-01"},
-        json={"model":MODEL,"max_tokens":max_tokens,"messages":[{"role":"user","content":prompt}]},
-        timeout=40
-    )
+        json={"model":"claude-haiku-4-5-20251001","max_tokens":max_tokens,
+              "messages":[{"role":"user","content":prompt}]},
+        timeout=40)
     resp.raise_for_status()
     text = next((c["text"] for c in resp.json().get("content",[]) if c.get("type")=="text"), "")
     return text.replace("```json","").replace("```","").strip()
 
-# ─── 분석 엔드포인트 ─────────────────────────────────────────────────────────
+def call_llm(prompt, max_tokens=1500):
+    llm = get_llm()
+    if llm == "gemini": return call_gemini(prompt, max_tokens)
+    if llm == "claude": return call_claude(prompt, max_tokens)
+    raise ValueError("LLM 키 없음 - GEMINI_API_KEY 또는 ANTHROPIC_API_KEY 설정 필요")
+
+# ─── 분석 API ────────────────────────────────────────────────────────────────
 
 @app.route("/api/analyze", methods=["POST"])
 def api_analyze():
@@ -193,50 +188,51 @@ def api_analyze():
     if not query or not arts:
         return jsonify({"error":"query, articles 필요"}), 400
 
-    # 상위 10개 기사 본문 병렬 fetch
-    top = arts[:10]
-    bodies = enrich_articles_parallel(top, max_workers=6)
+    # 1단계: 상위 8개 기사 본문 크롤링
+    print(f"[analyze] Crawling {min(len(arts),8)} articles for '{query}'...")
+    bodies = crawl_parallel(arts, n=8)
+    success = sum(1 for v in bodies.values() if v)
+    print(f"[analyze] Crawled: {success}/{min(len(arts),8)} articles got body text")
 
-    # 각 기사 콘텐츠 구성 (본문 있으면 본문, 없으면 description)
-    article_blocks = []
-    for a in top:
-        body_text = bodies.get(a['id'],"").strip()
-        content   = body_text if body_text else a.get('description','') or ''
-        if content:
-            article_blocks.append(
-                f"[{a['id']}] 제목: {a['title']} (출처: {a['source']})\n"
-                f"{'본문' if body_text else '요약'}: {content[:1500]}"
+    # 2단계: 각 기사 콘텐츠 구성
+    blocks = []
+    for a in arts[:8]:
+        body_text = bodies.get(a["id"],"").strip()
+        content   = body_text or a.get("description","") or ""
+        label     = "본문" if len(body_text) > 100 else "요약"
+        blocks.append(
+            "[{}] {} ({})\n{}: {}".format(
+                a["id"], a["title"], a["source"], label,
+                content[:1500] if content else "(내용 없음)"
             )
-        else:
-            article_blocks.append(f"[{a['id']}] 제목: {a['title']} (출처: {a['source']})")
+        )
 
-    content_str = "\n\n---\n\n".join(article_blocks)
-    has_body = any(v for v in bodies.values())
+    content_str = "\n\n---\n\n".join(blocks)
 
-    prompt = f"""당신은 한국 경제·금융 전문 뉴스 애널리스트입니다.
-검색 주제: "{query}"
+    prompt = """당신은 한국 경제/금융 뉴스 애널리스트입니다.
+검색 주제: "{}"
 
-{"아래는 실제 기사 본문입니다:" if has_body else "아래는 기사 제목 및 요약입니다:"}
+아래는 실제 기사 내용입니다:
 
-{content_str}
+{}
 
-위 내용을 바탕으로 JSON만 반환하세요 (마크다운 없이):
+위 기사 내용만을 근거로 JSON을 반환하세요 (마크다운 없이):
 {{
-  "overallSummary": "'{query}'를 둘러싼 현재 상황 3문장. 기사에서 확인된 구체적 사실(기업명·수치·날짜·사건)만 사용. 추측 금지.",
+  "overallSummary": "3문장. 기사에서 확인된 사실만. 구체적 기업명/수치/날짜 포함. 추측 금지.",
   "mainIssues": [
     {{
       "id": "i1",
       "title": "이슈 제목 20자 이내",
-      "desc": "이 이슈의 내용과 시장·투자자·규제 관점에서의 의미 2~3문장. 기사 내용 기반으로만 작성. 확인되지 않은 내용 금지.",
+      "desc": "이 이슈의 내용과 중요성 2~3문장. 반드시 기사 본문 근거. 없는 내용 지어내기 금지.",
       "refs": ["기사id"],
       "sev": "high|medium|low"
     }}
   ]
 }}
-한국어. 3~5개 이슈."""
+한국어. 3~5개 이슈.""".format(query, content_str)
 
     try:
-        parsed = json.loads(call_claude(prompt, 1500))
+        parsed = json.loads(call_llm(prompt, 1500))
         return jsonify({
             "summary": parsed.get("overallSummary",""),
             "issues":  [{"id":x.get("id",""),"title":x.get("title",""),
@@ -249,43 +245,49 @@ def api_analyze():
 
 @app.route("/api/detail", methods=["POST"])
 def api_detail():
-    body    = request.get_json(force=True)
-    query   = body.get("query","")
-    title   = body.get("title","")
-    url     = body.get("url","")
-    snippet = body.get("snippet","")
+    body   = request.get_json(force=True)
+    query  = body.get("query","")
+    title  = body.get("title","")
+    url    = body.get("url","")
 
-    # 실제 본문 fetch 시도
-    content = fetch_article_body(url)
+    # 기사 본문 크롤링
+    print(f"[detail] Crawling: {url[:80]}")
+    content = crawl_body(url)
+    print(f"[detail] Got {len(content)} chars")
+
     if not content:
-        content = snippet or ""
+        return jsonify({
+            "bullets": ["기사 본문을 가져올 수 없습니다. 원문 링크를 직접 확인해주세요."],
+            "rel": "", "impl": []
+        })
 
-    if not content:
-        return jsonify({"bullets":["기사 본문을 가져올 수 없습니다. 원문 링크를 직접 확인해주세요."],"rel":"","impl":[]}), 200
+    prompt = """한국 경제/금융 뉴스 분석. 검색 주제: "{}"
 
-    prompt = f"""한국 금융·경제 뉴스 애널리스트. 검색 주제: "{query}"
-
-기사 제목: {title}
-{'기사 본문' if len(content) > 100 else '기사 요약'}:
-{content[:3000]}
+기사 제목: {}
+기사 본문:
+{}
 
 JSON만 반환 (마크다운 없이):
 {{
-  "bullets": ["기사 본문에서 확인된 핵심 사실 4~5개. 각각 구체적 인물·기업·수치·날짜 포함. 본문에 없는 내용 절대 추가 금지."],
-  "rel": "이 기사가 '{query}'와 어떻게 직접 연결되는지 1~2문장. 실제 인과관계·영향 메커니즘 서술. '키워드 언급' 표현 금지.",
-  "impl": ["이 기사가 시사하는 투자·정책·시장 관점 전망 2~3개. 본문 내용 기반으로."]
+  "bullets": ["본문에서 확인된 핵심 사실 4~5개. 인물/기업/수치/날짜 포함. 본문에 없는 내용 절대 추가 금지."],
+  "rel": "'{}'와 어떻게 직접 연결되는지 1~2문장. 실제 인과관계 서술. '키워드 언급' 표현 금지.",
+  "impl": ["시사점 2~3개. 본문 근거."]
 }}
-한국어."""
+한국어.""".format(query, title, content[:3000], query)
 
     try:
-        return jsonify(json.loads(call_claude(prompt, 1000)))
+        return jsonify(json.loads(call_llm(prompt, 1000)))
     except Exception as e:
         return jsonify({"error":str(e)}), 500
 
 @app.route("/api/status")
 def api_status():
-    return jsonify({"claude": bool(CLAUDE_KEY), "model": MODEL if CLAUDE_KEY else None,
-                    "naver": bool(NAVER_ID and NAVER_SEC)})
+    return jsonify({
+        "llm":    get_llm(),
+        "gemini": bool(GEMINI_KEY),
+        "claude": bool(CLAUDE_KEY),
+        "naver":  bool(NAVER_ID),
+    })
 
 @app.route("/")
 def index():
@@ -293,7 +295,8 @@ def index():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"\n✅  http://localhost:{port}")
-    print(f"   Claude : {'✅ ' + MODEL if CLAUDE_KEY else '❌ ANTHROPIC_API_KEY 없음'}")
-    print(f"   Naver  : {'✅' if NAVER_ID else '❌ NAVER_CLIENT_ID 없음 (선택)'}\n")
+    llm  = get_llm()
+    print(f"\n http://localhost:{port}")
+    print(f"   LLM   : {llm or 'NONE - API key 필요'}")
+    print(f"   Naver : {'on' if NAVER_ID else 'off'}\n")
     app.run(host="0.0.0.0", port=port, debug=False)
