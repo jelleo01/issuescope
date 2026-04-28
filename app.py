@@ -133,7 +133,8 @@ def clean(text):
     return re.sub(r"\s+", " ", text).strip()
 
 def fetch_google_rss(query, max_items=40):
-    url = "https://news.google.com/rss/search?q={}&hl=ko&gl=KR&ceid=KR:ko".format(
+    # 영어 뉴스 RSS (description에 실제 기사 URL이 HTML entity로 포함됨)
+    url = "https://news.google.com/rss/search?q={}&hl=en-US&gl=US&ceid=US:en".format(
         requests.utils.quote(query))
     resp = requests.get(url, headers=RSS_HEADERS, timeout=12)
     resp.raise_for_status()
@@ -144,35 +145,29 @@ def fetch_google_rss(query, max_items=40):
         title = re.sub(r" - [^-]+$", "", clean(raw)).strip()
         if not title: continue
 
+        # description은 HTML entity encoded → ET가 자동 디코딩
         desc_raw = item.findtext("description") or ""
 
-        # 첫 3개 기사 description 구조 디버깅
-        if i < 3:
-            print(f"[rss-debug] desc raw: {repr(desc_raw[:300])}")
+        if i < 2:
+            print(f"[rss-debug] desc: {repr(desc_raw[:300])}")
 
-        # description에서 실제 뉴스 기사 URL만 추출 (구글·lh3 제외)
+        # 실제 기사 URL 추출 (google/lh3/gstatic 제외)
         real_urls = re.findall(
-            r'href="(https?://(?!(?:news\.google|lh3\.google|google\.com|gstatic)[^\s"])[^"]+)"',
+            r'href="(https?://(?!(?:news\.google|lh3\.google|google\.|gstatic\.)[^"]*)[^"]+)"',
             desc_raw)
-
-        # source 태그의 url 속성 활용
-        src_el = item.find("source")
-        source_url = src_el.get("url","") if src_el is not None else ""
-
         link = real_urls[0] if real_urls else ""
 
-        # fallback: source url 도메인 + 기사 검색 (없으면 빈값)
-        if not link and source_url:
-            print(f"[rss] no direct url, source domain: {source_url}")
-
         pub = item.findtext("pubDate") or ""
-        desc = clean(desc_raw)[:200]
+        # description에서 텍스트만 추출
+        desc_text = re.sub(r"<[^>]+>", "", desc_raw).strip()[:200]
+
+        src_el = item.find("source")
         source = (src_el.text.strip() if src_el is not None and src_el.text
                   else (re.search(r" - ([^-]+)$", raw) or [None,"알 수 없음"])[1])
-        print(f"[rss] '{title[:40]}' → {link[:70] or 'NO URL'}")
+
+        print(f"[rss] '{title[:45]}' → {link[:70] or 'NO URL'}")
         items.append({"title":title,"source":source,"url":link,
-                      "publishedAt":pub,"description":desc,
-                      "source_url": source_url})
+                      "publishedAt":pub,"description":desc_text})
     return items
 
 def fetch_naver(query, n=20):
@@ -342,8 +337,24 @@ JSON만 반환 (마크다운 없이):
     except Exception as e:
         return jsonify({"error":str(e)}), 500
 
-@app.route("/api/status")
-def api_status():
+@app.route("/api/test-crawl")
+def test_crawl():
+    """Railway 서버에서 한국 뉴스 사이트 접근 가능 여부 테스트"""
+    test_urls = [
+        "https://www.digitaltoday.co.kr",
+        "https://www.hankyung.com",
+        "https://www.mk.co.kr",
+        "https://n.news.naver.com",
+        "https://www.yna.co.kr",
+    ]
+    results = {}
+    for url in test_urls:
+        try:
+            r = requests.get(url, headers=CRAWL_HEADERS, timeout=6, allow_redirects=True)
+            results[url] = {"status": r.status_code, "bytes": len(r.content)}
+        except Exception as e:
+            results[url] = {"error": str(e)}
+    return jsonify(results)
     return jsonify({
         "llm":    get_llm(),
         "gemini": bool(GEMINI_KEY),
@@ -362,3 +373,34 @@ if __name__ == "__main__":
     print(f"   LLM   : {llm or 'NONE - API key 필요'}")
     print(f"   Naver : {'on' if NAVER_ID else 'off'}\n")
     app.run(host="0.0.0.0", port=port, debug=False)
+
+@app.route("/api/test-url")
+def test_url():
+    """특정 URL 크롤링 테스트"""
+    url = request.args.get("url","")
+    if not url:
+        return jsonify({"error": "url 파라미터 필요"})
+    real_url = resolve_google_url(url)
+    try:
+        r = requests.get(real_url or url, headers=CRAWL_HEADERS, timeout=10, allow_redirects=True)
+        body = crawl_body(real_url or url)
+        return jsonify({
+            "input_url": url,
+            "resolved_url": real_url,
+            "final_url": r.url,
+            "status": r.status_code,
+            "bytes": len(r.content),
+            "body_chars": len(body),
+            "body_preview": body[:500] if body else None
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+@app.route("/api/status")
+def api_status():
+    return jsonify({
+        "llm":    get_llm(),
+        "gemini": bool(GEMINI_KEY),
+        "claude": bool(CLAUDE_KEY),
+        "naver":  bool(NAVER_ID),
+    })
