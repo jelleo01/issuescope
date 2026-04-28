@@ -281,19 +281,19 @@ a:hover{text-decoration:underline}
   <h1 class="home-h1"><span class="home-h1-em">current issues</span></h1>
   <p class="home-sub">키워드를 입력하면 최신 뉴스를 수집·분석해<br>핵심 쟁점과 시사점을 즉시 추출합니다.</p>
   <div class="home-search-wrap">
-    <input class="home-input" id="home-input" placeholder="검색할 키워드 — 예: 전환사채, AI 규제, 금리 인하" />
+    <input class="home-input" id="home-input" placeholder="Search topic — e.g. Nvidia AI, Fed rate cut, Bitcoin ETF" />
     <button class="home-search-btn" id="home-btn">분석하기 →</button>
   </div>
   <div class="examples">
     <span class="ex-label">예시:</span>
-    <button class="ex-btn" data-q="전환사채">전환사채</button>
-    <button class="ex-btn" data-q="공매도">공매도</button>
-    <button class="ex-btn" data-q="AI 규제">AI 규제</button>
-    <button class="ex-btn" data-q="의대 증원">의대 증원</button>
-    <button class="ex-btn" data-q="금리 인하">금리 인하</button>
-    <button class="ex-btn" data-q="비트코인 ETF">비트코인 ETF</button>
-    <button class="ex-btn" data-q="삼성전자">삼성전자</button>
-    <button class="ex-btn" data-q="신주인수권">신주인수권</button>
+    <button class="ex-btn" data-q="Nvidia AI">Nvidia AI</button>
+    <button class="ex-btn" data-q="Fed interest rates">Fed rates</button>
+    <button class="ex-btn" data-q="AI regulation">AI regulation</button>
+    <button class="ex-btn" data-q="Bitcoin ETF">Bitcoin ETF</button>
+    <button class="ex-btn" data-q="Apple earnings">Apple earnings</button>
+    <button class="ex-btn" data-q="OpenAI GPT-5">OpenAI GPT-5</button>
+    <button class="ex-btn" data-q="Tesla FSD">Tesla FSD</button>
+    <button class="ex-btn" data-q="China tariffs">China tariffs</button>
   </div>
   <div class="home-footer">
     <span>실시간 Google 뉴스 수집</span>
@@ -490,7 +490,7 @@ async function fetchClaudeDetail(article, query) {
   const res = await fetch('/api/detail', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({query, title: article.title, snippet: article.snippet})
+    body: JSON.stringify({query, title: article.title, source: article.source})
   });
   if (!res.ok) throw new Error(`분석 서버 오류 ${res.status}`);
   const d = await res.json();
