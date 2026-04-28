@@ -490,7 +490,7 @@ async function fetchClaudeDetail(article, query) {
   const res = await fetch('/api/detail', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({query, title: article.title, source: article.source})
+    body: JSON.stringify({query, title: article.title, url: article.url, snippet: article.snippet})
   });
   if (!res.ok) throw new Error(`분석 서버 오류 ${res.status}`);
   const d = await res.json();
