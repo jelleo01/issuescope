@@ -44,16 +44,42 @@ BODY_SELECTORS = [
     "#article-view-content-div", "#newsct_article",
     ".article_view", ".article-content", ".article_content",
     ".view_cont", "#articeBody", "#newsBody",
-    "[itemprop='articleBody']", "article .content",
+    "[itemprop='articleBody']", "article",
 ]
+
+GOOGLE_NEWS_RE = re.compile(r"news\.google\.com")
+
+def resolve_google_url(url, timeout=6):
+    """Google News 리다이렉트 URL → 실제 기사 URL"""
+    if not GOOGLE_NEWS_RE.search(url):
+        return url
+    try:
+        # allow_redirects=False 로 Location 헤더에서 실제 URL 추출
+        r = requests.head(url, headers=CRAWL_HEADERS, timeout=timeout, allow_redirects=False)
+        location = r.headers.get("Location") or r.headers.get("location", "")
+        if location and location.startswith("http") and "google.com" not in location:
+            print(f"[resolve] {url[:60]} → {location[:80]}")
+            return location
+        # HEAD가 안되면 GET으로 리다이렉트 따라가기
+        r2 = requests.get(url, headers=CRAWL_HEADERS, timeout=timeout, allow_redirects=True)
+        if r2.url != url and "google.com" not in r2.url:
+            print(f"[resolve] GET redirect → {r2.url[:80]}")
+            return r2.url
+    except Exception as e:
+        print(f"[resolve] failed: {e}")
+    return url
 
 def crawl_body(url, timeout=8):
     """기사 URL → 본문 텍스트"""
     if not url or url == "#":
         return ""
+    # Google News URL이면 실제 URL로 변환
+    real_url = resolve_google_url(url, timeout=6)
+    print(f"[crawl] fetching: {real_url[:80]}")
     try:
-        resp = requests.get(url, headers=CRAWL_HEADERS, timeout=timeout, allow_redirects=True)
+        resp = requests.get(real_url, headers=CRAWL_HEADERS, timeout=timeout, allow_redirects=True)
         if not resp.ok or len(resp.text) < 500:
+            print(f"[crawl] failed: {resp.status_code}")
             return ""
         soup = BeautifulSoup(resp.text, "lxml")
         for tag in soup(["script","style","nav","header","footer","aside","iframe","noscript","figure"]):
@@ -63,13 +89,17 @@ def crawl_body(url, timeout=8):
             if el:
                 t = re.sub(r"\s+", " ", el.get_text()).strip()
                 if len(t) > 200:
+                    print(f"[crawl] got {len(t)} chars via '{sel}'")
                     return t[:3000]
-        # fallback: p 태그 모음
+        # fallback: p 태그
         paras = [p.get_text().strip() for p in soup.find_all("p") if len(p.get_text().strip()) > 50]
         if paras:
-            return re.sub(r"\s+", " ", " ".join(paras[:12]))[:3000]
-    except Exception:
-        pass
+            text = re.sub(r"\s+", " ", " ".join(paras[:12]))[:3000]
+            print(f"[crawl] got {len(text)} chars via <p> tags")
+            return text
+        print("[crawl] no body found")
+    except Exception as e:
+        print(f"[crawl] error: {e}")
     return ""
 
 def crawl_parallel(articles, n=8):
